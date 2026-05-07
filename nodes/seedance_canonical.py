@@ -26,7 +26,7 @@ from fal_client import AsyncClient
 from .fal_utils import FalConfig, ImageUtils
 from .video_node import (  # reuse helpers, fal_config, and validation constants
     fal_config,
-    _fetch_result_with_fallbacks,
+    _submit_with_retry,
     _upload_video,
     _upload_audio,
     SEEDANCE_REF_VIDEO_MIN_SEC,
@@ -79,6 +79,7 @@ class Seedance2ReferenceCanonical_NBC:
             "optional": {
                 "watermark": ("BOOLEAN", {"default": False}),
                 "auto_downscale": ("BOOLEAN", {"default": True}),
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
             },
         }
         # Numbered ref sockets, parity with reference_images / reference_videos / reference_audios.
@@ -101,7 +102,7 @@ class Seedance2ReferenceCanonical_NBC:
         return float("nan") if seed == -1 else seed
 
     async def generate(self, prompt, model, resolution, ratio, duration, generate_audio, seed,
-                       watermark=False, auto_downscale=True, **refs):
+                       watermark=False, auto_downscale=True, retry_on_policy_violation=2, **refs):
         # --- Tier validation ---
         if model not in _FAL_ENDPOINTS_BY_MODEL:
             raise ValueError(f"Unknown model tier: {model!r}")
@@ -206,10 +207,13 @@ class Seedance2ReferenceCanonical_NBC:
         # original ComfyUI node for the comfy.org API). We keep it on the schema for
         # architecture parity; can be wired through if fal exposes it later.
 
-        # --- Submit and fetch ---
+        # --- Submit and fetch with auto-retry on probabilistic content_policy_violation ---
         client = AsyncClient(key=fal_config.get_key())
-        handler = await client.submit(endpoint, arguments=args)
-        result = await _fetch_result_with_fallbacks(handler, endpoint)
+        result = await _submit_with_retry(
+            client, endpoint, args,
+            max_retries=retry_on_policy_violation,
+            retry_label="Seedance Reference Canonical",
+        )
         video_url = result["video"]["url"]
 
         # --- Download into ComfyUI temp dir, return as VideoFromFile (single VIDEO output) ---

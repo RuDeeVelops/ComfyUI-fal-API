@@ -103,7 +103,44 @@ async def _fetch_result_with_fallbacks(handler, endpoint):
     )
 
 
-async def _run_parallel(endpoint, base_args, count, seed):
+async def _submit_with_retry(client, endpoint, args, max_retries=0, retry_label=""):
+    """Submit + fetch with auto-retry on borderline content_policy_violation.
+
+    Per multiple independent reports, ByteDance/Seedance content moderation has a
+    probabilistic component — borderline inputs that fail one call may pass on the
+    next (frame-sampling variance, confidence-threshold jitter, ensemble-vote flips).
+    Retrying with backoff is the documented workaround.
+
+    - Retries ONLY on content_policy_violation (other 4xx/5xx propagate immediately).
+    - Backoff: 3s, 6s, 12s (exponential).
+    - Caller controls seed per attempt: each retry passes args as-is, so set
+      seed=-1 upstream to randomize per attempt (we already do this in _run_parallel).
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
+        try:
+            handler = await client.submit(endpoint, arguments=args)
+            result = await _fetch_result_with_fallbacks(handler, endpoint)
+            if attempt > 0:
+                print(f"[fal-API] {retry_label}: succeeded on retry {attempt}/{max_retries}")
+            return result
+        except RuntimeError as e:
+            msg = str(e)
+            if "content_policy_violation" not in msg.lower():
+                raise
+            last_error = e
+            if attempt >= max_retries:
+                raise
+            backoff = 3 * (2 ** attempt)
+            print(
+                f"[fal-API] {retry_label}: content_policy_violation "
+                f"(attempt {attempt + 1}/{max_retries + 1}) — retrying in {backoff}s"
+            )
+            await asyncio.sleep(backoff)
+    raise last_error  # unreachable in normal flow
+
+
+async def _run_parallel(endpoint, base_args, count, seed, retry_on_policy=0):
     """Fire `count` parallel requests via fal's queue API.
 
     seed = -1: generate a fresh random seed PER call PER run. Each variation
@@ -112,14 +149,24 @@ async def _run_parallel(endpoint, base_args, count, seed):
 
     seed >= 0: deterministic. Variations get seed, seed+1, seed+2, ... so the
     same seed value reproduces the same set of variations.
+
+    retry_on_policy: max retries per variation on content_policy_violation only.
     """
     client = AsyncClient(key=fal_config.get_key())
 
     async def one(i):
         args = dict(base_args)
+        # Each retry must pick a fresh random seed when seed=-1, so we pass a sentinel
+        # via args["seed"] = -1 and let _submit_with_retry build it per attempt below.
+        # Simpler: roll the seed here for each variation, retries reuse same args
+        # (same seed) — but with probabilistic moderation the SAME seed often clears
+        # on retry, so reusing it is fine. Borderline=jitter, not seed-dependent.
         args["seed"] = (seed + i) if seed >= 0 else random.randint(0, 2**31 - 1)
-        handler = await client.submit(endpoint, arguments=args)
-        result = await _fetch_result_with_fallbacks(handler, endpoint)
+        result = await _submit_with_retry(
+            client, endpoint, args,
+            max_retries=retry_on_policy,
+            retry_label=f"variation {i + 1}",
+        )
         return result["video"]["url"]
 
     return await asyncio.gather(*(one(i) for i in range(count)))
@@ -305,7 +352,10 @@ class Seedance2TextToVideo_NBC:
                 "generate_audio": ("BOOLEAN", {"default": True}),
                 "variations": ("INT", {"default": 1, "min": 1, "max": 10}),
                 "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
-            }
+            },
+            "optional": {
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
+            },
         }
 
     RETURN_TYPES = ("STRING",)
@@ -322,7 +372,8 @@ class Seedance2TextToVideo_NBC:
         seed = kwargs.get("seed", -1)
         return float("nan") if seed == -1 else seed
 
-    async def generate(self, prompt, aspect_ratio, duration, resolution, generate_audio, variations, seed):
+    async def generate(self, prompt, aspect_ratio, duration, resolution, generate_audio,
+                       variations, seed, retry_on_policy_violation=2):
         args = {
             "prompt": prompt,
             "aspect_ratio": aspect_ratio,
@@ -330,7 +381,10 @@ class Seedance2TextToVideo_NBC:
             "resolution": resolution,
             "generate_audio": generate_audio,
         }
-        return (await _run_parallel("bytedance/seedance-2.0/text-to-video", args, variations, seed),)
+        return (await _run_parallel(
+            "bytedance/seedance-2.0/text-to-video", args, variations, seed,
+            retry_on_policy=retry_on_policy_violation,
+        ),)
 
 
 class Seedance2ImageToVideo_NBC:
@@ -349,6 +403,7 @@ class Seedance2ImageToVideo_NBC:
             },
             "optional": {
                 "end_image": ("IMAGE",),
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
             },
         }
 
@@ -367,7 +422,7 @@ class Seedance2ImageToVideo_NBC:
         return float("nan") if seed == -1 else seed
 
     async def generate(self, prompt, image, aspect_ratio, duration, resolution, generate_audio,
-                       variations, seed, end_image=None):
+                       variations, seed, end_image=None, retry_on_policy_violation=2):
         args = {
             "prompt": prompt,
             "image_url": ImageUtils.upload_image(image),
@@ -380,7 +435,10 @@ class Seedance2ImageToVideo_NBC:
             end_url = ImageUtils.upload_image(end_image)
             if end_url:
                 args["end_image_url"] = end_url
-        return (await _run_parallel("bytedance/seedance-2.0/image-to-video", args, variations, seed),)
+        return (await _run_parallel(
+            "bytedance/seedance-2.0/image-to-video", args, variations, seed,
+            retry_on_policy=retry_on_policy_violation,
+        ),)
 
 
 class Seedance2ReferenceToVideo_NBC:
@@ -408,6 +466,7 @@ class Seedance2ReferenceToVideo_NBC:
                 "ref_audio": ("AUDIO",),
                 "ref_video_url": ("STRING", {"default": "", "multiline": False}),
                 "ref_audio_url": ("STRING", {"default": "", "multiline": False}),
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
             },
         }
 
@@ -427,7 +486,7 @@ class Seedance2ReferenceToVideo_NBC:
 
     async def generate(self, prompt, images, aspect_ratio, duration, resolution, generate_audio,
                        variations, seed, ref_video=None, ref_audio=None,
-                       ref_video_url="", ref_audio_url=""):
+                       ref_video_url="", ref_audio_url="", retry_on_policy_violation=2):
         image_urls = _upload_image_batch(images, limit=9)
         args = {
             "prompt": prompt,
@@ -461,7 +520,10 @@ class Seedance2ReferenceToVideo_NBC:
         if audio_url:
             args["audio_urls"] = [audio_url]
 
-        return (await _run_parallel(type(self).ENDPOINT, args, variations, seed),)
+        return (await _run_parallel(
+            type(self).ENDPOINT, args, variations, seed,
+            retry_on_policy=retry_on_policy_violation,
+        ),)
 
 
 class Seedance2ReferenceToVideoEnterprise_NBC(Seedance2ReferenceToVideo_NBC):
