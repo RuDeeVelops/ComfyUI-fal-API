@@ -668,6 +668,142 @@ class UploadVideo_fal:
 
 
 # ============================================================================
+# AUDIO EXTRACTION (companion to BlurFacesInVideo for full A/V Seedance pipelines)
+# ============================================================================
+
+class ExtractAudioFromVideo_NBC:
+    """Extract the audio track from a VIDEO and output as ComfyUI's standard AUDIO type.
+
+    Exact compatibility with native ComfyUI AUDIO consumers (Save Audio, the AUDIO
+    socket on Seedance Reference, etc.). Format: {waveform: float32 tensor [B,C,T],
+    sample_rate: int}.
+
+    Built specifically for the Seedance restyle workflow per fal/Segmind docs:
+    pass the same video into BOTH `video_1` (visual + baked-in timing) AND `audio_1`
+    (explicit @Audio1 lip-sync directive). This node is the bridge — wire its output
+    straight into the AUDIO socket without intermediate save/load steps.
+
+    Internally uses PyAV with libswresample for clean format conversion (handles s16,
+    s32, fltp, all standard codecs). Optional resampling and mono downmix.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+            },
+            "optional": {
+                "target_sample_rate": ("INT", {
+                    "default": 0, "min": 0, "max": 192000, "step": 1,
+                }),
+                "force_mono": ("BOOLEAN", {"default": False}),
+                "fail_silently": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "extract"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Output depends on source bytes; ComfyUI can't hash a VIDEO object reliably,
+        # so re-extract on every queue. Cheap operation.
+        return float("nan")
+
+    def extract(self, video, target_sample_rate=0, force_mono=False, fail_silently=False):
+        import av
+        import numpy as np
+
+        src = video.get_stream_source()
+        # Handle BytesIO input (rare but possible per the VideoFromFile API).
+        if not isinstance(src, str):
+            tmp_in = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            with open(tmp_in, "wb") as f:
+                if hasattr(src, "read"):
+                    src.seek(0)
+                    f.write(src.read())
+            src_path = tmp_in
+        else:
+            src_path = src
+
+        try:
+            container = av.open(src_path)
+        except Exception as e:
+            if fail_silently:
+                return self._silent_audio()
+            raise RuntimeError(f"Could not open video for audio extraction: {e}")
+
+        try:
+            audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+            if audio_stream is None:
+                if fail_silently:
+                    return self._silent_audio()
+                raise ValueError(
+                    "Source video has no audio track. Either pick a clip with sound, "
+                    "or set fail_silently=True to get a 1-second mono silence stub."
+                )
+
+            in_rate = int(audio_stream.rate or 44100)
+            out_rate = int(target_sample_rate) if target_sample_rate > 0 else in_rate
+            in_channels = int(audio_stream.channels or 1)
+            out_channels = 1 if force_mono else in_channels
+
+            # Pick a layout PyAV understands. Channels >2 keeps source layout.
+            if out_channels == 1:
+                out_layout = "mono"
+            elif out_channels == 2:
+                out_layout = "stereo"
+            else:
+                out_layout = audio_stream.layout.name if audio_stream.layout else "stereo"
+
+            # Resample to clean planar float, target rate, target layout. libswresample
+            # handles all the fixed/float, planar/packed, channel-layout mess.
+            resampler = av.AudioResampler(format="fltp", layout=out_layout, rate=out_rate)
+
+            chunks = []
+            for frame in container.decode(audio=0):
+                for rf in resampler.resample(frame):
+                    chunks.append(rf.to_ndarray())  # shape (C, T) for planar
+            # Flush
+            for rf in resampler.resample(None):
+                chunks.append(rf.to_ndarray())
+
+            if not chunks:
+                if fail_silently:
+                    return self._silent_audio(rate=out_rate, channels=out_channels)
+                raise ValueError("No audio frames could be decoded from source.")
+
+            arr = np.concatenate(chunks, axis=-1)  # (C, T)
+            if arr.ndim == 1:
+                arr = arr[None, :]
+            # Force float32 in [-1, 1]; PyAV's fltp output is already float32 normalized.
+            arr = arr.astype(np.float32, copy=False)
+
+            # ComfyUI AUDIO is shape (B, C, T) with B=1 typically.
+            waveform = torch.from_numpy(arr).unsqueeze(0).contiguous()
+
+            duration = arr.shape[-1] / out_rate
+            print(f"[fal-API] ExtractAudioFromVideo: {arr.shape[0]}ch x {arr.shape[-1]} samples "
+                  f"({duration:.2f}s @ {out_rate}Hz)")
+
+            return ({"waveform": waveform, "sample_rate": out_rate},)
+        finally:
+            container.close()
+
+    def _silent_audio(self, rate=44100, channels=1, seconds=1.0):
+        """Return a tiny silent AUDIO stub. Used when fail_silently=True and source
+        has no audio — keeps the workflow flowing without raising."""
+        import numpy as np
+        n_samples = max(1, int(rate * seconds))
+        arr = np.zeros((max(1, channels), n_samples), dtype=np.float32)
+        waveform = torch.from_numpy(arr).unsqueeze(0).contiguous()
+        return ({"waveform": waveform, "sample_rate": rate},)
+
+
+# ============================================================================
 # FACE BLUR (preprocess to bypass face-detection content filters)
 # ============================================================================
 
@@ -1172,6 +1308,7 @@ NODE_CLASS_MAPPINGS = {
     "Seedance2ReferenceToVideoEnterprise_NBC": Seedance2ReferenceToVideoEnterprise_NBC,
     "KlingV3Standard_NBC": KlingV3Standard_NBC,
     "BlurFacesInVideo_NBC": BlurFacesInVideo_NBC,
+    "ExtractAudioFromVideo_NBC": ExtractAudioFromVideo_NBC,
     "PreviewVideosFromURLs": PreviewVideosFromURLs,
     "LoadVideoURL": LoadVideoURL,
     "UploadVideo_fal": UploadVideo_fal,
@@ -1184,6 +1321,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Seedance2ReferenceToVideoEnterprise_NBC": "Seedance 2.0 Reference ENTERPRISE (NBC, cleared talent only)",
     "KlingV3Standard_NBC": "Kling V3 Standard Parallel (NBC)",
     "BlurFacesInVideo_NBC": "Blur Faces in Video (NBC)",
+    "ExtractAudioFromVideo_NBC": "Extract Audio from Video (NBC)",
     "PreviewVideosFromURLs": "Preview Videos from URLs (fal)",
     "LoadVideoURL": "Load Video from URL",
     "UploadVideo_fal": "Upload Video to Fal",
