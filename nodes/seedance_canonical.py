@@ -41,13 +41,15 @@ _FAL_ENDPOINTS_BY_MODEL = {
     "Seedance 2.0": "bytedance/seedance-2.0/reference-to-video",
     "Seedance 2.0 Fast": "bytedance/seedance-2.0/fast/reference-to-video",
     "Seedance 2.0 Enterprise": "bytedance/seedance-2.0/enterprise/reference-to-video",
+    "Seedance 2.0 Enterprise Fast": "bytedance/seedance-2.0/enterprise/fast/reference-to-video",
 }
 
-# Resolutions allowed per tier (matches official node's per-model resolution lists).
+# Resolutions allowed per tier (Fast tiers cap at 720p — no 1080p available).
 _RESOLUTIONS_BY_MODEL = {
     "Seedance 2.0": ["480p", "720p", "1080p"],
     "Seedance 2.0 Fast": ["480p", "720p"],
     "Seedance 2.0 Enterprise": ["480p", "720p", "1080p"],
+    "Seedance 2.0 Enterprise Fast": ["480p", "720p"],
 }
 
 _RATIOS = ["16:9", "4:3", "1:1", "3:4", "9:16", "21:9", "auto"]
