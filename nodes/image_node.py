@@ -1,10 +1,49 @@
-from .fal_utils import ApiHandler, ImageUtils, ResultProcessor
+import asyncio
+import random
+
+from fal_client import AsyncClient
+from .fal_utils import ApiHandler, FalConfig, ImageUtils, ResultProcessor
 
 
 # Remove all the configuration code since it's now handled by FalConfig
 def upload_image(image):
     """Upload image tensor to FAL and return URL."""
     return ImageUtils.upload_image(image)
+
+
+async def _run_parallel_image_calls(endpoint, base_args, variations, seed=None):
+    """Fire `variations` parallel calls and gather all results.
+
+    seed handling:
+      - None: no seed in args (caller's choice — fal randomizes server-side).
+      - -1:  generate a fresh random seed PER call PER run (truly different).
+      - >=0: deterministic — call i gets seed+i.
+
+    Returns a list of fal result dicts (one per call), each shaped like
+    {"images": [{"url": ...}, ...]}.
+    """
+    client = AsyncClient(key=FalConfig().get_key())
+
+    async def one(i):
+        args = dict(base_args)
+        if seed is not None:
+            args["seed"] = (seed + i) if seed >= 0 else random.randint(0, 2**31 - 1)
+        handler = await client.submit(endpoint, arguments=args)
+        return await handler.get()
+
+    return await asyncio.gather(*(one(i) for i in range(variations)))
+
+
+def _combine_image_results(results):
+    """Combine all images from N fal image results into a single ComfyUI IMAGE batch."""
+    all_urls = []
+    for r in results:
+        for img in (r or {}).get("images", []):
+            if img.get("url"):
+                all_urls.append(img["url"])
+    if not all_urls:
+        return ResultProcessor.create_blank_image()
+    return ResultProcessor.process_image_result({"images": [{"url": u} for u in all_urls]})
 
 
 class Sana:
@@ -1923,6 +1962,15 @@ class NanoBananaEdit:
 
 
 class NanoBananaPro:
+    """Nano Banana Pro with parallel variations.
+
+    Total images per click = `variations` * `num_images`.
+      - num_images: server-side variations within ONE call (cheap; one fal request).
+      - variations: client-side parallel calls (each call is its own fal credit hit).
+    Use num_images for free intra-call variation, variations for genuinely different
+    seeds / prompt-attempts. Default variations=1 to avoid surprise spending.
+    """
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -1932,6 +1980,7 @@ class NanoBananaPro:
             "optional": {
                 "images": ("IMAGE",),
                 "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 4}),
                 "aspect_ratio": (
                     ["auto", "21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"],
                     {"default": "1:1"},
@@ -1946,23 +1995,28 @@ class NanoBananaPro:
     FUNCTION = "generate_image"
     CATEGORY = "FAL/Image"
 
-    def generate_image(
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # NanoBanana Pro has no seed parameter, so consecutive runs with identical
+        # inputs will be cached by ComfyUI. Force re-execute every queue so users
+        # actually see new attempts.
+        return float("nan")
+
+    async def generate_image(
         self,
         prompt,
         images=None,
         num_images=1,
+        variations=1,
         aspect_ratio="1:1",
         output_format="png",
         resolution="1K",
         sync_mode=False,
     ):
-        # Prepare image URLs from optional input, limit to 14 images max
         if images is not None and hasattr(images, 'shape') and len(images.shape) == 4 and images.shape[0] > 14:
-            # If batch has more than 14 images, take only first 14
             images = images[:14]
         image_urls = ImageUtils.prepare_images(images)
 
-        # Build base arguments
         arguments = {
             "prompt": prompt,
             "num_images": num_images,
@@ -1972,23 +2026,102 @@ class NanoBananaPro:
             "sync_mode": sync_mode,
         }
 
-        # Conditional endpoint routing based on whether ANY images provided
         if len(image_urls) > 0:
-            # Use edit endpoint with image_urls array
             endpoint = "fal-ai/nano-banana-pro/edit"
             arguments["image_urls"] = image_urls
         else:
-            # Use text-to-image endpoint (no image_urls parameter)
             endpoint = "fal-ai/nano-banana-pro"
-            # Remove "auto" from aspect_ratio for text-to-image endpoint
             if aspect_ratio == "auto":
                 arguments["aspect_ratio"] = "1:1"
 
         try:
-            result = ApiHandler.submit_and_get_result(endpoint, arguments)
-            return ResultProcessor.process_image_result(result)
+            results = await _run_parallel_image_calls(endpoint, arguments, variations, seed=None)
+            return _combine_image_results(results)
         except Exception as e:
             return ApiHandler.handle_image_generation_error("Nano Banana Pro", e)
+
+
+class NanoBanana2:
+    """Nano Banana 2 with parallel variations.
+
+    Total images per click = `variations` * `num_images`.
+      - num_images: server-side variations within ONE call (cheap).
+      - variations: client-side parallel calls (each costs an extra fal credit).
+      - seed = -1: truly random per call per run.
+      - seed >= 0: deterministic — variation i gets seed+i.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+            },
+            "optional": {
+                "images": ("IMAGE",),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "aspect_ratio": (
+                    ["auto", "21:9", "16:9", "3:2", "4:3", "5:4", "1:1", "4:5", "3:4", "2:3", "9:16"],
+                    {"default": "1:1"},
+                ),
+                "output_format": (["jpeg", "png", "webp"], {"default": "png"}),
+                "resolution": (["0.5K", "1K", "2K", "4K"], {"default": "1K"}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
+                "enable_web_search": ("BOOLEAN", {"default": False}),
+                "sync_mode": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "generate_image"
+    CATEGORY = "FAL/Image"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        seed = kwargs.get("seed", -1)
+        return float("nan") if seed == -1 else seed
+
+    async def generate_image(
+        self,
+        prompt,
+        images=None,
+        num_images=1,
+        variations=1,
+        aspect_ratio="1:1",
+        output_format="png",
+        resolution="1K",
+        seed=-1,
+        enable_web_search=False,
+        sync_mode=False,
+    ):
+        if images is not None and hasattr(images, 'shape') and len(images.shape) == 4 and images.shape[0] > 14:
+            images = images[:14]
+        image_urls = ImageUtils.prepare_images(images)
+
+        arguments = {
+            "prompt": prompt,
+            "num_images": num_images,
+            "aspect_ratio": aspect_ratio,
+            "output_format": output_format,
+            "resolution": resolution,
+            "enable_web_search": enable_web_search,
+            "sync_mode": sync_mode,
+        }
+
+        if len(image_urls) > 0:
+            endpoint = "fal-ai/nano-banana-2/edit"
+            arguments["image_urls"] = image_urls
+        else:
+            endpoint = "fal-ai/nano-banana-2"
+            if aspect_ratio == "auto":
+                arguments["aspect_ratio"] = "1:1"
+
+        try:
+            results = await _run_parallel_image_calls(endpoint, arguments, variations, seed=seed)
+            return _combine_image_results(results)
+        except Exception as e:
+            return ApiHandler.handle_image_generation_error("Nano Banana 2", e)
 
 
 class ReveTextToImage:
@@ -2241,6 +2374,7 @@ NODE_CLASS_MAPPINGS = {
     "NanoBananaTextToImage_fal": NanoBananaTextToImage,
     "NanoBananaEdit_fal": NanoBananaEdit,
     "NanoBananaPro_fal": NanoBananaPro,
+    "NanoBanana2_fal": NanoBanana2,
     "ReveTextToImage_fal": ReveTextToImage,
     "Dreamina31TextToImage_fal": Dreamina31TextToImage,
     "GPTImage15Edit_fal": GPTImage15Edit,
@@ -2273,6 +2407,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "NanoBananaTextToImage_fal": "Nano Banana Text-to-Image (fal)",
     "NanoBananaEdit_fal": "Nano Banana Edit (fal)",
     "NanoBananaPro_fal": "Nano Banana Pro (fal)",
+    "NanoBanana2_fal": "Nano Banana 2 (fal)",
     "ReveTextToImage_fal": "Reve Text-to-Image (fal)",
     "Dreamina31TextToImage_fal": "Dreamina v3.1 Text-to-Image (fal)",
     "GPTImage15Edit_fal": "GPT-Image 1.5 Edit (fal)",
