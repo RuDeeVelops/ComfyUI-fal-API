@@ -281,15 +281,22 @@ def _upload_video(video, min_seconds=None, max_seconds=None,
 def _upload_audio(audio, max_seconds=None):
     """Upload a ComfyUI AUDIO dict ({waveform, sample_rate}) as a WAV file and return its URL.
 
+    Uses Python's stdlib `wave` module to write 16-bit PCM — zero new dependencies,
+    works regardless of whether torchaudio's backend is sox / soundfile / torchcodec.
+    (Recent torchaudio defaults to torchcodec which isn't always installed; we sidestep
+    the whole question by writing the WAV ourselves.)
+
     If `max_seconds` is set, validates duration before upload and raises ValueError on overflow.
     """
     if audio is None:
         return None
     try:
-        import torchaudio
+        import wave
+        import numpy as np
+
         waveform = audio["waveform"]
         sample_rate = int(audio["sample_rate"])
-        # ComfyUI AUDIO is shape (B, C, T); torchaudio.save expects (C, T).
+        # ComfyUI AUDIO is shape (B, C, T); we want (C, T) for writing.
         if waveform.ndim == 3:
             waveform = waveform[0]
         elif waveform.ndim == 1:
@@ -303,8 +310,29 @@ def _upload_audio(audio, max_seconds=None):
                     f"(fal Seedance Reference allows at most {max_seconds:.0f}s combined across @Audio refs)."
                 )
 
+        # Convert float32 [-1, 1] -> int16 PCM, then write interleaved bytes.
+        arr = waveform.detach().cpu().numpy()
+        if arr.dtype.kind == "f":
+            arr = np.clip(arr, -1.0, 1.0)
+            arr_int16 = (arr * 32767.0).astype(np.int16)
+        elif arr.dtype == np.int16:
+            arr_int16 = arr
+        else:
+            # int8/int32/etc — normalize through float
+            max_val = float(np.iinfo(arr.dtype).max) if arr.dtype.kind == "i" else 1.0
+            arr_int16 = (arr.astype(np.float32) / max_val * 32767.0).clip(-32768, 32767).astype(np.int16)
+
+        channels = arr_int16.shape[0]
+        # WAV expects interleaved samples: (T, C) in memory layout, then to bytes.
+        interleaved = arr_int16.T.tobytes()
+
         tmp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-        torchaudio.save(tmp_path, waveform.cpu(), sample_rate, format="wav")
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setnchannels(channels)
+            wf.setsampwidth(2)  # 16-bit = 2 bytes per sample
+            wf.setframerate(sample_rate)
+            wf.writeframes(interleaved)
+
         try:
             return ImageUtils.upload_file(tmp_path)
         finally:
