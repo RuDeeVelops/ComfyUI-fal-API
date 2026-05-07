@@ -441,101 +441,11 @@ class Seedance2ImageToVideo_NBC:
         ),)
 
 
-class Seedance2ReferenceToVideo_NBC:
-    # Endpoint id (overridable in subclasses for the enterprise tier, etc.)
-    ENDPOINT = "bytedance/seedance-2.0/reference-to-video"
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {
-                    "default": "@Image1 performs the action from @Video1",
-                    "multiline": True,
-                }),
-                "images": ("IMAGE",),
-                "aspect_ratio": (SEEDANCE_ASPECT, {"default": "16:9"}),
-                "duration": (SEEDANCE_DURATIONS, {"default": "5"}),
-                "resolution": (SEEDANCE_RESOLUTIONS, {"default": "720p"}),
-                "generate_audio": ("BOOLEAN", {"default": True}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
-            },
-            "optional": {
-                "ref_video": ("VIDEO",),
-                "ref_audio": ("AUDIO",),
-                "ref_video_url": ("STRING", {"default": "", "multiline": False}),
-                "ref_audio_url": ("STRING", {"default": "", "multiline": False}),
-                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_urls",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate"
-    CATEGORY = "FAL/NBC_Approved"
-
-    @classmethod
-    def IS_CHANGED(cls, **kwargs):
-        # When seed = -1 (random), force ComfyUI to re-execute on every queue.
-        # Otherwise the cached result is reused and the user can't get a new variation
-        # without manually editing the seed. seed >= 0 is treated as deterministic.
-        seed = kwargs.get("seed", -1)
-        return float("nan") if seed == -1 else seed
-
-    async def generate(self, prompt, images, aspect_ratio, duration, resolution, generate_audio,
-                       variations, seed, ref_video=None, ref_audio=None,
-                       ref_video_url="", ref_audio_url="", retry_on_policy_violation=2):
-        image_urls = _upload_image_batch(images, limit=9)
-        args = {
-            "prompt": prompt,
-            "image_urls": image_urls,
-            "aspect_ratio": aspect_ratio,
-            "duration": duration,
-            "resolution": resolution,
-            "generate_audio": generate_audio,
-        }
-
-        # For each modality: socket beats URL. Connecting the socket auto-uploads.
-        # Validate duration BEFORE upload so we fail fast with a clear message
-        # instead of getting a generic 422 from fal.
-        if ref_video is not None:
-            video_url = _upload_video(
-                ref_video,
-                min_seconds=SEEDANCE_REF_VIDEO_MIN_SEC,
-                max_seconds=SEEDANCE_REF_VIDEO_MAX_SEC,
-                max_bytes=SEEDANCE_REF_VIDEO_MAX_BYTES,
-                max_long_dim=SEEDANCE_REF_VIDEO_MAX_LONG_DIM,
-            )
-        else:
-            video_url = ref_video_url.strip() or None
-        if video_url:
-            args["video_urls"] = [video_url]
-
-        if ref_audio is not None:
-            audio_url = _upload_audio(ref_audio, max_seconds=SEEDANCE_REF_AUDIO_MAX_SEC)
-        else:
-            audio_url = ref_audio_url.strip() or None
-        if audio_url:
-            args["audio_urls"] = [audio_url]
-
-        return (await _run_parallel(
-            type(self).ENDPOINT, args, variations, seed,
-            retry_on_policy=retry_on_policy_violation,
-        ),)
-
-
-class Seedance2ReferenceToVideoEnterprise_NBC(Seedance2ReferenceToVideo_NBC):
-    """Enterprise tier of Seedance 2.0 Reference-to-Video.
-
-    Identical schema and behavior to the standard NBC node, but routes to the
-    enterprise endpoint, which Legal has cleared for use with real-person likeness
-    (talent images / footage of public figures, etc.). Use this only for content
-    that has been legally cleared per NBC's standard talent-rights process —
-    standard endpoint remains the right default for everything else.
-    """
-    ENDPOINT = "bytedance/seedance-2.0/enterprise/reference-to-video"
+# NOTE: The legacy Seedance2ReferenceToVideo_NBC and Seedance2ReferenceToVideoEnterprise_NBC
+# nodes have been REMOVED. They were single-image / single-video / single-audio nodes.
+# Use Seedance2ReferenceCanonical_NBC instead — it has the same I/O shape (and more):
+# multi-reference (up to 9 images, 3 videos, 3 audios), built-in model tier selector
+# (Standard / Fast / Enterprise), single VIDEO output. See nodes/seedance_canonical.py.
 
 
 class KlingV3Standard_NBC:
@@ -1304,8 +1214,6 @@ class PreviewVideosFromURLs:
 NODE_CLASS_MAPPINGS = {
     "Seedance2TextToVideo_NBC": Seedance2TextToVideo_NBC,
     "Seedance2ImageToVideo_NBC": Seedance2ImageToVideo_NBC,
-    "Seedance2ReferenceToVideo_NBC": Seedance2ReferenceToVideo_NBC,
-    "Seedance2ReferenceToVideoEnterprise_NBC": Seedance2ReferenceToVideoEnterprise_NBC,
     "KlingV3Standard_NBC": KlingV3Standard_NBC,
     "BlurFacesInVideo_NBC": BlurFacesInVideo_NBC,
     "ExtractAudioFromVideo_NBC": ExtractAudioFromVideo_NBC,
@@ -1317,8 +1225,6 @@ NODE_CLASS_MAPPINGS = {
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Seedance2TextToVideo_NBC": "Seedance 2.0 T2V Parallel (NBC)",
     "Seedance2ImageToVideo_NBC": "Seedance 2.0 I2V Parallel (NBC)",
-    "Seedance2ReferenceToVideo_NBC": "Seedance 2.0 Reference Parallel (NBC)",
-    "Seedance2ReferenceToVideoEnterprise_NBC": "Seedance 2.0 Reference ENTERPRISE (NBC, cleared talent only)",
     "KlingV3Standard_NBC": "Kling V3 Standard Parallel (NBC)",
     "BlurFacesInVideo_NBC": "Blur Faces in Video (NBC)",
     "ExtractAudioFromVideo_NBC": "Extract Audio from Video (NBC)",
