@@ -61,8 +61,11 @@ async def _fetch_result_with_fallbacks(handler, endpoint):
     surfaced immediately with the server's body — those aren't "try another URL"
     situations, they're real errors fal is telling us about.
     """
-    # Poll status to completion (status URL always works server-side).
-    async for _ in handler.iter_events(with_logs=False, interval=1.5):
+    _quiet_windows_asyncio_noise()  # idempotent; suppresses harmless ProactorEventLoop log spam
+    # Poll status to completion. 10s interval keeps log noise down on Seedance Reference's
+    # 5-15 min runs (was 1.5s = 400-600 polls per job). Native ByteDance node polls
+    # at similar cadence. This adds at most ~10s latency at completion.
+    async for _ in handler.iter_events(with_logs=False, interval=10.0):
         pass
 
     base = "https://queue.fal.run"
@@ -122,6 +125,42 @@ def _is_deterministic_policy_violation(error_msg: str) -> bool:
     return "content_policy_violation" in msg and any(
         p in msg for p in _DETERMINISTIC_POLICY_PATTERNS
     )
+
+
+# Windows-specific: asyncio's ProactorEventLoop sometimes raises ConnectionResetError
+# from _call_connection_lost AFTER an HTTP request has already succeeded. The actual
+# request is fine — this is a known cleanup-race bug in cpython asyncio on Windows
+# (search "ProactorBasePipeTransport _call_connection_lost ConnectionResetError 10054").
+# We install a one-time exception handler that silently drops these specific noise
+# events. Functional behavior is unchanged.
+_QUIET_HANDLER_INSTALLED = False
+
+
+def _quiet_windows_asyncio_noise():
+    global _QUIET_HANDLER_INSTALLED
+    if _QUIET_HANDLER_INSTALLED:
+        return
+    import sys
+    if sys.platform != "win32":
+        _QUIET_HANDLER_INSTALLED = True
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # no loop yet; will install next time we're called from one
+    prior = loop.get_exception_handler()
+
+    def _quiet(loop, context):
+        exc = context.get("exception")
+        if isinstance(exc, ConnectionResetError):
+            return  # harmless ProactorEventLoop cleanup race
+        if prior is not None:
+            prior(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(_quiet)
+    _QUIET_HANDLER_INSTALLED = True
 
 
 async def _submit_with_retry(client, endpoint, args, max_retries=0, retry_label=""):
