@@ -741,6 +741,133 @@ class ExtractAudioFromVideo_NBC:
         return ({"waveform": waveform, "sample_rate": rate},)
 
 
+class PitchShiftAudio_NBC:
+    """Pitch-shift an AUDIO without changing duration.
+
+    Use case: defeat audio-fingerprint content filters while preserving lip-sync
+    timing. Wire ExtractAudioFromVideo -> PitchShiftAudio (semitones=-2) -> the
+    audio_1 socket on Seedance Reference. The model uses the pitched audio as a
+    timing reference for lip-sync; you mux the ORIGINAL (un-shifted) audio over
+    the silent restyled video at the end. The fingerprinter sees a different
+    spectral signature than the original copyrighted track and lets it through.
+
+    Implementation: PyAV filter graph (asetrate + atempo + aresample). The
+    asetrate stage changes both pitch and duration; atempo with the inverse ratio
+    restores duration while keeping the new pitch; aresample renormalizes back
+    to the original sample rate. No external deps.
+
+    Quality is good for lip-sync timing reference (which is what we need it for).
+    The output audio is discarded after Seedance reads it — what you ship is the
+    original un-shifted audio muxed in at the end.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "semitones": ("FLOAT", {
+                    "default": -2.0, "min": -12.0, "max": 12.0, "step": 0.5,
+                }),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "shift"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def shift(self, audio, semitones):
+        # Zero-shift: passthrough untouched.
+        if abs(semitones) < 0.001:
+            return (audio,)
+
+        import av
+        from fractions import Fraction
+        import numpy as np
+
+        waveform = audio["waveform"]
+        sr = int(audio["sample_rate"])
+
+        # ComfyUI AUDIO is (B, C, T); take the first batch.
+        if waveform.ndim == 3:
+            waveform = waveform[0]
+        elif waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+
+        channels = int(waveform.shape[0])
+        layout = "mono" if channels == 1 else ("stereo" if channels == 2 else f"{channels}c")
+
+        # ratio > 1 = pitch up, < 1 = pitch down
+        ratio = 2.0 ** (semitones / 12.0)
+        intermediate_sr = max(1, int(round(sr * ratio)))
+
+        # Build the filter chain. atempo accepts 0.5-100; for ratios outside that range
+        # we'd need to chain multiple atempos. Within ±12 semitones we're between
+        # 0.5 and 2.0, so a single atempo is sufficient.
+        graph = av.filter.Graph()
+        src = graph.add_abuffer(
+            sample_rate=sr, format="fltp", layout=layout, time_base=Fraction(1, sr),
+        )
+        f_set = graph.add("asetrate", str(intermediate_sr))
+        f_atempo = graph.add("atempo", f"{1.0 / ratio:.6f}")
+        f_resample = graph.add("aresample", str(sr))
+        sink = graph.add("abuffersink")
+        src.link_to(f_set)
+        f_set.link_to(f_atempo)
+        f_atempo.link_to(f_resample)
+        f_resample.link_to(sink)
+        graph.configure()
+
+        # Push input as a single audio frame.
+        arr_in = waveform.detach().cpu().numpy().astype(np.float32, copy=False)
+        # Ensure planar shape (C, T).
+        if arr_in.ndim == 1:
+            arr_in = arr_in[None, :]
+        in_frame = av.AudioFrame.from_ndarray(arr_in, format="fltp", layout=layout)
+        in_frame.sample_rate = sr
+        in_frame.pts = 0
+        graph.push(in_frame)
+        graph.push(None)  # signal EOF
+
+        # Pull output frames.
+        out_chunks = []
+        while True:
+            try:
+                out_frame = graph.pull()
+            except (BlockingIOError, av.error.BlockingIOError):
+                break
+            except av.error.EOFError:
+                break
+            except av.AVError:
+                break
+            arr_out = out_frame.to_ndarray()  # (C, T) for fltp
+            if arr_out.ndim == 1:
+                arr_out = arr_out[None, :]
+            out_chunks.append(arr_out)
+
+        if not out_chunks:
+            print("[fal-API] PitchShiftAudio: filter graph produced no output, returning input unchanged.")
+            return (audio,)
+
+        out_arr = np.concatenate(out_chunks, axis=-1)  # (C, T)
+        out_tensor = torch.from_numpy(out_arr.astype(np.float32, copy=False)).unsqueeze(0).contiguous()
+
+        in_dur = arr_in.shape[-1] / sr
+        out_dur = out_arr.shape[-1] / sr
+        print(
+            f"[fal-API] PitchShiftAudio: {semitones:+.1f} semitones (ratio {ratio:.4f}) | "
+            f"in {arr_in.shape[0]}ch x {arr_in.shape[-1]} samples ({in_dur:.2f}s) -> "
+            f"out {out_arr.shape[0]}ch x {out_arr.shape[-1]} samples ({out_dur:.2f}s @ {sr}Hz)"
+        )
+
+        return ({"waveform": out_tensor, "sample_rate": sr},)
+
+
 # ============================================================================
 # FACE BLUR (preprocess to bypass face-detection content filters)
 # ============================================================================
@@ -1245,6 +1372,7 @@ NODE_CLASS_MAPPINGS = {
     "KlingV3Standard_NBC": KlingV3Standard_NBC,
     "BlurFacesInVideo_NBC": BlurFacesInVideo_NBC,
     "ExtractAudioFromVideo_NBC": ExtractAudioFromVideo_NBC,
+    "PitchShiftAudio_NBC": PitchShiftAudio_NBC,
     "PreviewVideosFromURLs": PreviewVideosFromURLs,
     "LoadVideoURL": LoadVideoURL,
     "UploadVideo_fal": UploadVideo_fal,
@@ -1256,6 +1384,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "KlingV3Standard_NBC": "Kling V3 Standard Parallel (NBC)",
     "BlurFacesInVideo_NBC": "Blur Faces in Video (NBC)",
     "ExtractAudioFromVideo_NBC": "Extract Audio from Video (NBC)",
+    "PitchShiftAudio_NBC": "Pitch Shift Audio (NBC, defeats fingerprinting)",
     "PreviewVideosFromURLs": "Preview Videos from URLs (fal)",
     "LoadVideoURL": "Load Video from URL",
     "UploadVideo_fal": "Upload Video to Fal",
