@@ -4,6 +4,7 @@ import traceback
 node_list = [
     "image_node",
     "video_node",
+    "seedance_canonical",
     "llm_node",
     "vlm_node",
     "trainer_node",
