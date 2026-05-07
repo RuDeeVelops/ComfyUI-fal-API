@@ -1,2397 +1,615 @@
 import asyncio
+import math
 import os
+import random
 import tempfile
-
+import time
 import cv2
+import httpx
 import numpy as np
-import requests
 import torch
+import requests
+import folder_paths
 from fal_client import AsyncClient
-
 from .fal_utils import ApiHandler, FalConfig, ImageUtils
 
-# Initialize FalConfig
 fal_config = FalConfig()
 
-class MiniMaxNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-            },
-        }
+# ============================================================================
+# SHARED ENUMS — sourced from fal.ai OpenAPI schemas
+# ============================================================================
 
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
+SEEDANCE_DURATIONS = ["auto", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
+SEEDANCE_ASPECT = ["auto", "16:9", "9:16", "1:1", "21:9", "4:3", "3:4"]
+SEEDANCE_RESOLUTIONS = ["480p", "720p", "1080p"]
+KLING_DURATIONS = ["3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15"]
+# Kling I2V API does NOT accept aspect_ratio (output ratio = input image ratio).
+# We expose it on the node and center-crop the input image client-side, matching how
+# Flora and other UIs work around the API limitation.
+KLING_ASPECT = ["auto", "16:9", "9:16", "1:1"]
+ASPECT_RATIOS = {
+    "16:9": 16 / 9,
+    "9:16": 9 / 16,
+    "1:1": 1.0,
+    "21:9": 21 / 9,
+    "4:3": 4 / 3,
+    "3:4": 3 / 4,
+}
 
-    def generate_video(self, prompt, image):
+# ============================================================================
+# CORE HELPERS
+# ============================================================================
+
+def _extract_error_body(resp):
+    """Best-effort: pull the most informative slice out of a fal error response."""
+    try:
+        body = resp.json()
+        # fal returns errors as {"detail": [...]} or {"detail": "..."} or similar
+        if isinstance(body, dict) and "detail" in body:
+            return body["detail"]
+        return body
+    except Exception:
+        return resp.text[:1000] if hasattr(resp, "text") else "<no body>"
+
+
+async def _fetch_result_with_fallbacks(handler, endpoint):
+    """Wait for completion, then fetch the result with fault-tolerant URL fallback.
+
+    fal returns the final result via response_url. For broken queue routing on
+    very new endpoints we try a few URL shapes. Critically: 4xx codes that
+    indicate AUTHORITATIVE failure (422 = validation error, 401/403 = auth) are
+    surfaced immediately with the server's body — those aren't "try another URL"
+    situations, they're real errors fal is telling us about.
+    """
+    # Poll status to completion (status URL always works server-side).
+    async for _ in handler.iter_events(with_logs=False, interval=1.5):
+        pass
+
+    base = "https://queue.fal.run"
+    rid = handler.request_id
+    status_base = handler.status_url[:-len("/status")] if handler.status_url.endswith("/status") else handler.status_url
+    candidates = [
+        handler.response_url,
+        f"{base}/{endpoint}/requests/{rid}",
+        f"{base}/{endpoint}/requests/{rid}/response",
+        f"{status_base}/response",
+    ]
+
+    errors = []
+    for url in candidates:
         try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "minimax/video-01-live", "Failed to upload image"
+            resp = await handler.client.get(url)
+            sc = resp.status_code
+            if sc == 200:
+                return resp.json()
+            # Authoritative failures from fal — don't waste time on other URLs.
+            if sc in (401, 403, 422, 400):
+                detail = _extract_error_body(resp)
+                raise RuntimeError(
+                    f"fal rejected the request (HTTP {sc}). This is a real "
+                    f"validation/auth error from the server, not a routing bug.\n"
+                    f"endpoint: {endpoint}\nrequest_id: {rid}\n"
+                    f"server says: {detail}"
                 )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-            }
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/minimax/video-01-live/image-to-video", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
+            errors.append(f"  {url} -> HTTP {sc}: {(_extract_error_body(resp) or '')!s:.200}")
+        except RuntimeError:
+            raise
         except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "minimax/video-01-live", str(e)
-            )
-
-
-class MiniMaxTextToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt):
-        try:
-            arguments = {
-                "prompt": prompt,
-            }
-
-            result = ApiHandler.submit_and_get_result("fal-ai/minimax-video", arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("minimax-video", str(e))
-
-
-class MiniMaxSubjectReferenceNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "subject_reference_image": ("IMAGE",),
-                "prompt_optimizer": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, subject_reference_image, prompt_optimizer):
-        try:
-            image_url = ImageUtils.upload_image(subject_reference_image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "minimax/video-01-subject-reference",
-                    "Failed to upload subject reference image",
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "subject_reference_image_url": image_url,
-                "prompt_optimizer": prompt_optimizer,
-            }
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/minimax/video-01-subject-reference", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "minimax/video-01-subject-reference", str(e)
-            )
-
-
-class KlingNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, duration, aspect_ratio, image=None):
-        arguments = {
-            "prompt": prompt,
-            "duration": duration,
-            "aspect_ratio": aspect_ratio,
-        }
-
-        try:
-            if image is not None:
-                image_url = ImageUtils.upload_image(image)
-                if image_url:
-                    arguments["image_url"] = image_url
-                    result = ApiHandler.submit_and_get_result(
-                        "fal-ai/kling-video/v1/standard/image-to-video", arguments
-                    )
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v1/standard", "Failed to upload image"
-                    )
-            else:
-                result = ApiHandler.submit_and_get_result(
-                    "fal-ai/kling-video/v1/standard/text-to-video", arguments
-                )
-
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v1/standard", str(e)
-            )
-
-
-class KlingPro10Node:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-                "tail_image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self, prompt, duration, aspect_ratio, image=None, tail_image=None
-    ):
-        arguments = {
-            "prompt": prompt,
-            "duration": duration,
-            "aspect_ratio": aspect_ratio,
-        }
-
-        try:
-            if image is not None:
-                image_url = ImageUtils.upload_image(image)
-                if image_url:
-                    arguments["image_url"] = image_url
-
-                    # Handle tail image if provided
-                    if tail_image is not None:
-                        tail_image_url = ImageUtils.upload_image(tail_image)
-                        if tail_image_url:
-                            arguments["tail_image_url"] = tail_image_url
-                        else:
-                            return ApiHandler.handle_video_generation_error(
-                                "kling-video/v1/pro", "Failed to upload tail image"
-                            )
-
-                    result = ApiHandler.submit_and_get_result(
-                        "fal-ai/kling-video/v1/pro/image-to-video", arguments
-                    )
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v1/pro", "Failed to upload image"
-                    )
-            else:
-                result = ApiHandler.submit_and_get_result(
-                    "fal-ai/kling-video/v1/pro/text-to-video", arguments
-                )
-
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v1/pro", str(e)
-            )
-
-
-class KlingPro16Node:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-                "tail_image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self, prompt, duration, aspect_ratio, image=None, tail_image=None
-    ):
-        arguments = {
-            "prompt": prompt,
-            "duration": duration,
-            "aspect_ratio": aspect_ratio,
-        }
-
-        try:
-            if image is not None:
-                image_url = ImageUtils.upload_image(image)
-                if image_url:
-                    arguments["image_url"] = image_url
-
-                    # Handle tail image if provided
-                    if tail_image is not None:
-                        tail_image_url = ImageUtils.upload_image(tail_image)
-                        if tail_image_url:
-                            arguments["tail_image_url"] = tail_image_url
-                        else:
-                            return ApiHandler.handle_video_generation_error(
-                                "kling-video/v1.6/pro", "Failed to upload tail image"
-                            )
-
-                    result = ApiHandler.submit_and_get_result(
-                        "fal-ai/kling-video/v1.6/pro/image-to-video", arguments
-                    )
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v1.6/pro", "Failed to upload image"
-                    )
-            else:
-                result = ApiHandler.submit_and_get_result(
-                    "fal-ai/kling-video/v1.6/pro/text-to-video", arguments
-                )
-
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v1.6/pro", str(e)
-            )
-
-
-class KlingMasterNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, duration, aspect_ratio, image=None):
-        arguments = {
-            "prompt": prompt,
-            "duration": duration,
-            "aspect_ratio": aspect_ratio,
-        }
-
-        try:
-            if image is not None:
-                image_url = ImageUtils.upload_image(image)
-                if image_url:
-                    arguments["image_url"] = image_url
-                    result = ApiHandler.submit_and_get_result(
-                        "fal-ai/kling-video/v2/master/image-to-video", arguments
-                    )
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v2/master", "Failed to upload image"
-                    )
-            else:
-                result = ApiHandler.submit_and_get_result(
-                    "fal-ai/kling-video/v2/master/text-to-video", arguments
-                )
-
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v2/master", str(e)
-            )
-        
-class KlingOmniImageToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "start_image": ("IMAGE",),
-            },
-            "optional": {
-                "end_image": ("IMAGE",),
-                "duration": (["5", "10"], {"default": "5"}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, start_image, end_image=None, duration="5", variations=1):
-        try:
-            start_image_url = ImageUtils.upload_image(start_image)
-            if not start_image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "kling-video/o1/image-to-video", "Failed to upload start image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "start_image_url": start_image_url,
-                "duration": duration,
-            }
-
-            if end_image is not None:
-                end_image_url = ImageUtils.upload_image(end_image)
-                if end_image_url:
-                    arguments["end_image_url"] = end_image_url
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/o1/image-to-video", "Failed to upload end image"
-                    )
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/kling-video/o1/image-to-video", arguments, variations
-            )
-            return ([r["video"]["url"] for r in results],)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/o1/image-to-video", str(e)
-            )
-
-class KlingOmniReferenceToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-            },
-            "optional": {
-                "reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_1_frontal_image": ("IMAGE",),
-                "element_1_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_2_frontal_image": ("IMAGE",),
-                "element_2_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_3_frontal_image": ("IMAGE",),
-                "element_3_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_4_frontal_image": ("IMAGE",),
-                "element_4_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_5_frontal_image": ("IMAGE",),
-                "element_5_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_6_frontal_image": ("IMAGE",),
-                "element_6_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_7_frontal_image": ("IMAGE",),
-                "element_7_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self,
-        prompt,
-        reference_images=None,
-        element_1_frontal_image=None,
-        element_1_reference_images=None,
-        element_2_frontal_image=None,
-        element_2_reference_images=None,
-        element_3_frontal_image=None,
-        element_3_reference_images=None,
-        element_4_frontal_image=None,
-        element_4_reference_images=None,
-        element_5_frontal_image=None,
-        element_5_reference_images=None,
-        element_6_frontal_image=None,
-        element_6_reference_images=None,
-        element_7_frontal_image=None,
-        element_7_reference_images=None,
-        duration="5",
-        aspect_ratio="16:9",
-        variations=1
-    ):
-        try:
-            arguments = {
-                "prompt": prompt,
-                "duration": duration,
-                "aspect_ratio": aspect_ratio,
-            }
-
-            # Handle reference images
-            if reference_images is not None:
-                ref_image_urls = ImageUtils.prepare_images(reference_images)
-                if ref_image_urls:
-                    arguments["image_urls"] = ref_image_urls
-
-            # Build elements array
-            elements = []
-
-            # Process each element (up to 7)
-            for i in range(1, 8):
-                frontal_img = locals().get(f"element_{i}_frontal_image")
-                ref_imgs = locals().get(f"element_{i}_reference_images")
-
-                if frontal_img is not None:
-                    element = {}
-
-                    # Upload frontal image
-                    frontal_url = ImageUtils.upload_image(frontal_img)
-                    if frontal_url:
-                        element["frontal_image_url"] = frontal_url
-
-                    # Upload reference images if provided
-                    if ref_imgs is not None:
-                        ref_urls = ImageUtils.prepare_images(ref_imgs)
-                        if ref_urls:
-                            element["reference_image_urls"] = ref_urls
-
-                    elements.append(element)
-
-            if elements:
-                arguments["elements"] = elements
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/kling-video/o1/reference-to-video", arguments, variations
-            )
-            return ([r["video"]["url"] for r in results],)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/o1/reference-to-video", str(e)
-            )
-
-class KlingOmniVideoToVideoEditNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "video": ("VIDEO",),
-            },
-            "optional": {
-                "keep_audio": ("BOOLEAN", {"default": False}),
-                "reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_1_frontal_image": ("IMAGE",),
-                "element_1_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_2_frontal_image": ("IMAGE",),
-                "element_2_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_3_frontal_image": ("IMAGE",),
-                "element_3_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_4_frontal_image": ("IMAGE",),
-                "element_4_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        prompt,
-        video,
-        keep_audio=False,
-        reference_images=None,
-        element_1_frontal_image=None,
-        element_1_reference_images=None,
-        element_2_frontal_image=None,
-        element_2_reference_images=None,
-        element_3_frontal_image=None,
-        element_3_reference_images=None,
-        element_4_frontal_image=None,
-        element_4_reference_images=None,
-        variations=1
-    ):
-        try:
-            video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "kling-video/o1/video-to-video/edit", "Failed to upload video"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "video_url": video_url,
-                "keep_audio": keep_audio,
-            }
-
-            # Handle reference images
-            if reference_images is not None:
-                ref_image_urls = ImageUtils.prepare_images(reference_images)
-                if ref_image_urls:
-                    arguments["image_urls"] = ref_image_urls
-
-            # Build elements array
-            elements = []
-
-            # Process each element (up to 4 for video-to-video/edit)
-            for i in range(1, 5):
-                frontal_img = locals().get(f"element_{i}_frontal_image")
-                ref_imgs = locals().get(f"element_{i}_reference_images")
-
-                if frontal_img is not None:
-                    element = {}
-
-                    # Upload frontal image
-                    frontal_url = ImageUtils.upload_image(frontal_img)
-                    if frontal_url:
-                        element["frontal_image_url"] = frontal_url
-
-                    # Upload reference images if provided
-                    if ref_imgs is not None:
-                        ref_urls = ImageUtils.prepare_images(ref_imgs)
-                        if ref_urls:
-                            element["reference_image_urls"] = ref_urls
-
-                    elements.append(element)
-
-            if elements:
-                arguments["elements"] = elements
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/kling-video/o1/video-to-video/edit", arguments, variations
-            )
-            return ([r["video"]["url"] for r in results],)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/o1/video-to-video/edit", str(e)
-            )
-
-class KlingOmniVideoToVideoReferenceNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "video": ("VIDEO",),
-            },
-            "optional": {
-                "keep_audio": ("BOOLEAN", {"default": False}),
-                "reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_1_frontal_image": ("IMAGE",),
-                "element_1_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_2_frontal_image": ("IMAGE",),
-                "element_2_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_3_frontal_image": ("IMAGE",),
-                "element_3_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "element_4_frontal_image": ("IMAGE",),
-                "element_4_reference_images": ("IMAGE", {"default": None, "multiple": True}),
-                "aspect_ratio": (["auto", "16:9", "9:16", "1:1"], {"default": "auto"}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self,
-        prompt,
-        video,
-        keep_audio=False,
-        reference_images=None,
-        element_1_frontal_image=None,
-        element_1_reference_images=None,
-        element_2_frontal_image=None,
-        element_2_reference_images=None,
-        element_3_frontal_image=None,
-        element_3_reference_images=None,
-        element_4_frontal_image=None,
-        element_4_reference_images=None,
-        aspect_ratio="auto",
-        duration="5",
-        variations=1
-    ):
-        try:
-            video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "kling-video/o1/video-to-video/reference", "Failed to upload video"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "video_url": video_url,
-                "keep_audio": keep_audio,
-                "aspect_ratio": aspect_ratio,
-                "duration": duration,
-            }
-
-            # Handle reference images
-            if reference_images is not None:
-                ref_image_urls = ImageUtils.prepare_images(reference_images)
-                if ref_image_urls:
-                    arguments["image_urls"] = ref_image_urls
-
-            # Build elements array
-            elements = []
-
-            # Process each element (up to 4 for video-to-video/reference)
-            for i in range(1, 5):
-                frontal_img = locals().get(f"element_{i}_frontal_image")
-                ref_imgs = locals().get(f"element_{i}_reference_images")
-
-                if frontal_img is not None:
-                    element = {}
-
-                    # Upload frontal image
-                    frontal_url = ImageUtils.upload_image(frontal_img)
-                    if frontal_url:
-                        element["frontal_image_url"] = frontal_url
-
-                    # Upload reference images if provided
-                    if ref_imgs is not None:
-                        ref_urls = ImageUtils.prepare_images(ref_imgs)
-                        if ref_urls:
-                            element["reference_image_urls"] = ref_urls
-
-                    elements.append(element)
-
-            if elements:
-                arguments["elements"] = elements
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/kling-video/o1/video-to-video/reference", arguments, variations
-            )
-            return ([r["video"]["url"] for r in results],)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/o1/video-to-video/reference", str(e)
-            )
-
-class RunwayGen3Node:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "duration": (["5", "10"], {"default": "5"}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, duration):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "runway-gen3", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": duration,
-            }
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/runway-gen3/turbo/image-to-video", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("runway-gen3", str(e))
-
-
-class LumaDreamMachineNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "mode": (
-                    ["text-to-video", "image-to-video"],
-                    {"default": "text-to-video"},
-                ),
-                "aspect_ratio": (
-                    ["16:9", "9:16", "4:3", "3:4", "21:9", "9:21"],
-                    {"default": "16:9"},
-                ),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-                "end_image": ("IMAGE",),
-                "loop": ("BOOLEAN", {"default": False}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self, prompt, mode, aspect_ratio, image=None, end_image=None, loop=False
-    ):
-        arguments = {
-            "prompt": prompt,
-            "aspect_ratio": aspect_ratio,
-            "loop": loop,
-        }
-
-        try:
-            if mode == "image-to-video":
-                if image is None:
-                    return ApiHandler.handle_video_generation_error(
-                        "luma-dream-machine",
-                        "Image is required for image-to-video mode",
-                    )
-                image_url = ImageUtils.upload_image(image)
-                if not image_url:
-                    return ApiHandler.handle_video_generation_error(
-                        "luma-dream-machine", "Failed to upload image"
-                    )
-                arguments["image_url"] = image_url
-
-                if end_image is not None:
-                    end_image_url = ImageUtils.upload_image(end_image)
-                    if end_image_url:
-                        arguments["end_image_url"] = end_image_url
-                    else:
-                        return ApiHandler.handle_video_generation_error(
-                            "luma-dream-machine", "Failed to upload end image"
-                        )
-
-                endpoint = "fal-ai/luma-dream-machine/ray-2/image-to-video"
-            else:
-                endpoint = "fal-ai/luma-dream-machine/ray-2"
-
-            result = ApiHandler.submit_and_get_result(endpoint, arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "luma-dream-machine", str(e)
-            )
-
-
-class Veo2ImageToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "aspect_ratio": (
-                    ["auto", "auto_prefer_portrait", "16:9", "9:16"],
-                    {"default": "auto"},
-                ),
-                "duration": (["5s", "6s", "7s", "8s"], {"default": "5s"}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, aspect_ratio, duration):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "veo2", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "aspect_ratio": aspect_ratio,
-                "duration": duration,
-            }
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/veo2/image-to-video", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("veo2", str(e))
-
-
-class WanProNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-            },
-            "optional": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
-                "enable_safety_checker": ("BOOLEAN", {"default": True}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, seed=0, enable_safety_checker=True, variations=1):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-pro", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "enable_safety_checker": enable_safety_checker,
-            }
-
-            # Only add seed if it's not 0 (default)
-            if seed != 0:
-                arguments["seed"] = seed
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/wan-pro/image-to-video", arguments, variations
-            )
-
-            return ([r["video"]["url"] for r in results],)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("wan-pro", str(e))
-
-class Wan25Node:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-            },
-            "optional": {
-                "seed": ("INT", {"default": 0, "min": 0, "max": 2147483647}),
-                "resolution": (
-                    ["480p", "720p", "1080p"],
-                    {"default": "1080p"}),
-                "duration": (
-                    ["5", "10"],
-                    {"default": "5"}),
-                "negative_prompt": ("STRING", {"default": "low resolution, error, worst quality, low quality, defects", "multiline": True}),
-                "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self,
-        prompt,
-        image,
-        seed=0,
-        resolution="1080p",
-        duration="5",
-        negative_prompt="low resolution, error, worst quality, low quality, defects",
-        enable_prompt_expansion=True,
-        variations=1,
-    ):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-25", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "resolution": resolution,
-                "duration": duration,
-                "negative_prompt": negative_prompt,
-                "enable_prompt_expansion": enable_prompt_expansion,
-            }
-
-            # include seed if non-default
-            if seed != 0:
-                arguments["seed"] = seed
-
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/wan-25-preview/image-to-video", arguments, variations
-            )
-
-            return ([r["video"]["url"] for r in results],)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("wan-25", str(e))
-        
-        
-class WanVACEVideoEditNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-            },
-            "optional": {
-                "video": ("VIDEO", {"default": None}),
-                "input_video_url": ("STRING", {"default": ""}),
-                
-                "images": ("IMAGE", {"default": None, "multiple": True}),
-                "video_type": (["auto", "general", "human"], {"default": "auto"}),
-                "resolution": (
-                    ["auto", "240p", "360p", "480p", "580p", "720p", "1080p"],
-                    {"default": "auto"}
-                ),
-                "acceleration": (["regular", "low", "none", "default"], {"default": "regular"}),
-                "enable_auto_downsample": ("BOOLEAN", {"default": True}),
-                "aspect_ratio": (["auto", "16:9", "9:16", "1:1"], {"default": "auto"}),
-                "auto_downsample_min_fps": ("INT", {"default": 15, "min": 1, "max": 60}),
-                "enable_safety_checker": ("BOOLEAN", {"default": True}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        prompt,
-        video=None,
-        input_video_url="",
-        images=None,
-        video_type="auto",
-        resolution="auto",
-        acceleration="regular",
-        enable_auto_downsample=True,
-        aspect_ratio="auto",
-        auto_downsample_min_fps=15,
-        enable_safety_checker=True,
-        variations=1,
-    ):
-        try:
-            if video is None and input_video_url is "":
-                return ApiHandler.handle_video_generation_error(
-                    "wan-vace", "Video or Video Frames input is required."
-                )
-            if video is None and input_video_url is not "":
-                video_url = input_video_url
-            else:
-                video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-vace", "Failed to upload video"
-                )
-            arguments = {
-                "prompt": prompt,
-                "video_url": video_url,
-                "video_type": video_type,
-                "resolution": resolution,
-                "acceleration": acceleration,
-                "enable_auto_downsample": enable_auto_downsample,
-                "aspect_ratio": aspect_ratio,
-                "auto_downsample_min_fps": auto_downsample_min_fps,
-                "enable_safety_checker": enable_safety_checker,
-            }
-
-            image_urls = []
-
-            if images is not None:
-                import torch
-
-                if isinstance(images, torch.Tensor):
-                    if images.ndim == 4 and images.shape[0] > 1:
-                        for i in range(images.shape[0]):
-                            single_img = images[i:i+1]
-                            img_url = ImageUtils.upload_image(single_img)
-                            if img_url:
-                                image_urls.append(img_url)
-                    else:
-                        img_url = ImageUtils.upload_image(images)
-                        if img_url:
-                            image_urls.append(img_url)
-
-                elif isinstance(images, (list, tuple)):
-                    for img in images:
-                        img_url = ImageUtils.upload_image(img)
-                        if img_url:
-                            image_urls.append(img_url)
-
-            if image_urls:
-                arguments["image_urls"] = image_urls
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/wan-vace-apps/video-edit",
-                arguments,
-                variations
-            )
-
-            return ([r["video"]["url"] for r in results],)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("wan-vace", str(e))
-
-
-class Wan2214bAnimateReplaceNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE", {"default": None}),
-            },
-            "optional": {
-                "video": ("VIDEO", {"default": None}),
-                "input_video_url": ("STRING", {"default": ""}),
-                "turbo": ("BOOLEAN", {"default": True}),
-                "resolution": (
-                    ["480p", "580p", "720p"],
-                    {"default": "480p"}
-                ),
-                "seed": ("INT", {"default": 24, "min": 0, "max": 2147483647}),
-                "num_inference_steps": ("INT", {"default": 20, "min": 1, "max": 40, "step": 1}),
-                "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1}),
-                "shift": ("INT", {"default": 8, "min": 1, "max": 10, "step": 1}),
-                "video_quality": (["low", "medium", "high", "maximum"], {"default": "high"}),
-                "video_write_mode": (["balanced", "fast", "small"], {"default": "balanced"}),
-                "enable_safety_checker": ("BOOLEAN", {"default": True}),
-                "enable_output_safety_checker": ("BOOLEAN", {"default": False}),
-                "return_frames_zip": ("BOOLEAN", {"default": False}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING","STRING")
-    RETURN_NAMES = ("video_url","frames_zip_url",)
-    OUTPUT_IS_LIST = (True,True)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        image=None,
-        video=None,
-        input_video_url="",
-        turbo=True,
-        resolution="480p",
-        seed=24,
-        num_inference_steps=20,
-        guidance_scale=1.0,
-        shift=8,
-        video_quality="high",
-        video_write_mode="balanced",
-        enable_safety_checker=True,
-        enable_output_safety_checker=False,
-        return_frames_zip=False,
-        variations=1,
-    ):
-        try:
-            if video is None and input_video_url is "":
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22animatereplace", "Video or Video Frames input is required."
-                )
-            if video is None and input_video_url is not "":
-                video_url = input_video_url
-            else:
-                video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22animatereplace", "Failed to upload video"
-                )
-
-          
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22animatereplace", "Failed to upload image"
-                )
-
-            arguments={
-                "video_url": video_url,
-                "image_url": image_url,
-                "turbo": turbo,
-                "resolution": resolution,
-                "seed": seed,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "shift": shift,
-                "video_quality": video_quality,
-                "video_write_mode": video_write_mode,
-                "enable_safety_checker": enable_safety_checker,
-                "enable_output_safety_checker": enable_output_safety_checker,
-                "return_frames_zip": return_frames_zip,
-            }
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/wan/v2.2-14b/animate/replace",
-                arguments,
-                variations
-            )
-
-            video_url = [r["video"]["url"] for r in results]
-            frames_zip_url = [r.get("frames_zip", {}).get("url", "") for r in results] if return_frames_zip else [""] * len(results)
-
-            return (video_url, frames_zip_url)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("wan-22animatereplace", str(e))
-
-
-
-
-class Wan2214bAnimateMoveNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE", {"default": None}),
-            },
-            "optional": {
-                "video": ("VIDEO", {"default": None}),
-                "input_video_url": ("STRING", {"default": ""}),
-                "turbo": ("BOOLEAN", {"default": True}),
-                "resolution": (
-                    ["480p", "580p", "720p"],
-                    {"default": "480p"}
-                ),
-                "seed": ("INT", {"default": 24, "min": 0, "max": 2147483647}),
-                "num_inference_steps": ("INT", {"default": 20, "min": 1, "max": 40, "step": 1}),
-                "guidance_scale": ("FLOAT", {"default": 1.0, "min": 1.0, "max": 10.0, "step": 0.1}),
-                "shift": ("INT", {"default": 8, "min": 1, "max": 10, "step": 1}),
-                "video_quality": (["low", "medium", "high", "maximum"], {"default": "high"}),
-                "video_write_mode": (["balanced", "fast", "small"], {"default": "balanced"}),
-                "enable_safety_checker": ("BOOLEAN", {"default": True}),
-                "enable_output_safety_checker": ("BOOLEAN", {"default": False}),
-                "return_frames_zip": ("BOOLEAN", {"default": False}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING")
-    RETURN_NAMES = ("video_url","frames_zip_url",)
-    OUTPUT_IS_LIST = (True,True)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        image=None,
-        video=None,
-        input_video_url="",
-        turbo=True,
-        resolution="480p",
-        seed=24,
-        num_inference_steps=20,
-        guidance_scale=1.0,
-        shift=8,
-        video_quality="high",
-        video_write_mode="balanced",
-        enable_safety_checker=True,
-        enable_output_safety_checker=False,
-        return_frames_zip=False,
-        variations=1,
-    ):
-        try:
-            if video is None and input_video_url is "":
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22animatereplace", "Video or Video Frames input is required."
-                )
-            if video is None and input_video_url is not "":
-                video_url = input_video_url
-            else:
-                video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22animatereplace", "Failed to upload video"
-                )
-          
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22animatemove", "Failed to upload image"
-                )
-
-            arguments={
-                "video_url": video_url,
-                "image_url": image_url,
-                "turbo": turbo,
-                "resolution": resolution,
-                "seed": seed,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "shift": shift,
-                "video_quality": video_quality,
-                "video_write_mode": video_write_mode,
-                "enable_safety_checker": enable_safety_checker,
-                "enable_output_safety_checker": enable_output_safety_checker,
-                "return_frames_zip": return_frames_zip,
-            }
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/wan/v2.2-14b/animate/move",
-                arguments,
-                variations
-            )
-
-            video_url = [r["video"]["url"] for r in results]
-            frames_zip_url = [r.get("frames_zip", {}).get("url", "") for r in results] if return_frames_zip else [""] * len(results)
-
-            return (video_url, frames_zip_url)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("wan-22animatemove", str(e))
-
-
-
-class Wan22VACEFun14bNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": ""}),
-                "video": ("VIDEO", {"default": None}),
-            },
-            "optional": {
-                "task": (["depth", "pose"], {"default": "depth"}),
-                "preprocess": ("BOOLEAN", {"default": True}),
-                "ref_images": ("IMAGE", {"default": None, "multiple": True}),
-                "first_frame": ("IMAGE", {"default": None}),
-                "last_frame": ("IMAGE", {"default": None}),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-                "seed": ("INT", {"default": 24, "min": 0, "max": 2147483647}),
-                "resolution": (
-                    ["480p", "580p", "720p"],
-                    {"default": "480p"}
-                ),
-                "aspect_ratio": (["auto", "16:9", "9:16", "1:1"], {"default": "auto"}),
-                "num_inference_steps": ("INT", {"default": 30, "min": 1}),
-                "guidance_scale": ("FLOAT", {"default": 5, "min": 0.0, "max": 10}),
-                "sampler": (["unipc", "dpm++", "euler"], {"default": "unipc"}),
-                "match_input_num_frames": ("BOOLEAN", {"default": False}),
-                "num_frames": ("INT", {"default": 81, "min": 17, "max": 241}),
-                "match_input_frames_per_second": ("BOOLEAN", {"default": False}),
-                "frames_per_second": ("INT", {"default": 16, "min": 5, "max": 30}),
-                "shift": ("INT", {"default": 5}),
-                "acceleration": (["none", "low", "regular"], {"default": "regular"}),
-                "video_quality": (["low", "medium", "high"], {"default": "high"}),
-                "video_write_mode": (["balanced", "fast", "small"], {"default": "balanced"}),
-                "return_frames_zip": ("BOOLEAN", {"default": False}),
-                "num_interpolated_frames": ("INT", {"default": 0, "min": 0, "max": 5}),
-                "temporal_downsample_factor": ("INT", {"default": 0, "min": 0, "max": 5}),
-                "enable_auto_downsample": ("BOOLEAN", {"default": False}),
-                "auto_downsample_min_fps": ("INT", {"default": 15, "min": 1, "max": 60}),
-                "interpolator_model": (["rife", "film"], {"default": "film"}),
-                "enable_safety_checker": ("BOOLEAN", {"default": False}),
-                "enable_output_safety_checker": ("BOOLEAN", {"default": False}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING",)
-    RETURN_NAMES = ("video_url", "frames_zip_url",)
-    OUTPUT_IS_LIST = (True, True,)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        prompt="",
-        video=None,
-        task="depth",
-        preprocess=True,
-        ref_images=None,
-        first_frame=None,
-        last_frame=None,
-        negative_prompt="",
-        seed=-1,
-        resolution="480p",
-        aspect_ratio="auto",
-        num_inference_steps=30,
-        guidance_scale=5,
-        sampler="unipc",
-        match_input_num_frames=False,
-        num_frames=81,
-        match_input_frames_per_second=False,
-        frames_per_second=16,
-        shift=5,
-        acceleration="regular",
-        video_quality="high",
-        video_write_mode="balanced",
-        return_frames_zip=False,
-        num_interpolated_frames=0,
-        temporal_downsample_factor=0,
-        enable_auto_downsample=False,
-        auto_downsample_min_fps=15,
-        interpolator_model="film",
-        enable_safety_checker=False,
-        enable_output_safety_checker=False,
-        variations=1,
-    ):
-        try:
-            if video is None:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22-vace-fun-a14b", "Video input is required."
-                )
-
-            video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "wan-22-vace-fun-a14b", "Failed to upload video"
-                )
-
-            # Build arguments
-            arguments = {
-                "prompt": prompt,
-                "video_url": video_url,
-                "preprocess": preprocess,
-                "negative_prompt": negative_prompt,
-                "resolution": resolution,
-                "aspect_ratio": aspect_ratio,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "sampler": sampler,
-                "num_frames": num_frames,
-                "frames_per_second": frames_per_second,
-                "shift": shift,
-                "acceleration": acceleration,
-                "video_quality": video_quality,
-                "video_write_mode": video_write_mode,
-                "return_frames_zip": return_frames_zip,
-                "num_interpolated_frames": num_interpolated_frames,
-                "temporal_downsample_factor": temporal_downsample_factor,
-                "enable_auto_downsample": enable_auto_downsample,
-                "auto_downsample_min_fps": auto_downsample_min_fps,
-                "interpolator_model": interpolator_model,
-                "enable_safety_checker": enable_safety_checker,
-                "enable_output_safety_checker": enable_output_safety_checker,
-            }
-
-            # Set seed
-            if seed != -1:
-                arguments["seed"] = seed
-
-            # Handle optional match_input settings
-            if match_input_num_frames and video is not None:
-                try:
-                    arguments["num_frames"] = len(list(video.get_stream()))
-                except:
-                    pass
-            if match_input_frames_per_second and video is not None:
-                try:
-                    arguments["frames_per_second"] = video.get_fps()
-                except:
-                    pass
-
-            # Upload reference images if provided
-            if ref_images is not None:
-                ref_image_urls = ImageUtils.prepare_images(ref_images)
-                if ref_image_urls:
-                    arguments["ref_image_urls"] = ref_image_urls
-
-            # Upload first frame if provided
-            if first_frame is not None:
-                first_frame_url = ImageUtils.upload_image(first_frame)
-                if first_frame_url:
-                    arguments["first_frame_image_url"] = first_frame_url
-
-            # Upload last frame if provided
-            if last_frame is not None:
-                last_frame_url = ImageUtils.upload_image(last_frame)
-                if last_frame_url:
-                    arguments["last_frame_image_url"] = last_frame_url
-
-            # Submit to API with task-specific endpoint
-            results = ApiHandler.submit_multiple_and_get_results(
-                f"fal-ai/wan-22-vace-fun-a14b/{task}",
-                arguments,
-                variations
-            )
-
-            # Return list of outputs
-            video_url = [r["video"]["url"] for r in results]
-            frames_zip_url = [r.get("frames_zip", {}).get("url", "") for r in results] if return_frames_zip else [""] * len(results)
-
-            return (video_url, frames_zip_url)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("wan-22-vace-fun-a14b", str(e))
-
-
-# =============================================================================
-# HYPER CUSTOM DY ENDPOINTS
-# =============================================================================
-# These are specialized, highly customizable DY endpoints with extensive
-# parameter sets for advanced video generation and manipulation tasks.
-# =============================================================================
-
-class DYWanFun22Node:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "architecture": (["vace", "control"], {"default": "vace"}),
-                "control_video": ("VIDEO", {"default": None}),
-                "ref_image": ("IMAGE", {"default": None}),
-            },
-            "optional": {
-                "turbo_mode": ("BOOLEAN", {"default": True}),
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-                "image_size": (["custom", "square_hd", "square", "portrait_4_3", "portrait_16_9", "landscape_4_3", "landscape_16_9"], {"default": "custom"}),
-                "custom_width": ("INT", {"default": 1280, "min": 0, "max": 8192, "step": 8}),
-                "custom_height": ("INT", {"default": 720, "min": 0, "max": 8192, "step": 8}),
-                "num_frames": ("INT", {"default": 81, "min": 1, "max": 1000}),
-                "frames_per_second": ("INT", {"default": 16, "min": 5, "max": 30}),
-                "num_inference_steps": ("INT", {"default": 4, "min": 1, "max": 100}),
-                "guidance_scale": ("FLOAT", {"default": 1, "min": 0.0, "max": 10.0}),
-                "seed": ("INT", {"default": -1, "min": 0, "max": 2147483647}),
-                "sampler": (["uni_pc", "dpmpp_2m", "dpmpp_2m_sde", "euler", "euler_ancestral"], {"default": "uni_pc"}),
-                "shift": ("INT", {"default": 5, "min": 0, "max": 10}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1}),
-                # Control strengths
-                "vace_mask_video": ("VIDEO", {"default": None}),
-                "preprocess_all_maps": ("BOOLEAN", {"default": True}),
-                "strength_vace": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0}),
-                "pose_strength": ("FLOAT", {"default": 0.6, "min": 0.0, "max": 1.0}),
-                "pose_video": ("VIDEO", {"default": None, "multiple": True}),
-                "depth_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0}),
-                "depth_video": ("VIDEO", {"default": None, "multiple": True}),
-                "normal_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0}),
-                "normal_video": ("VIDEO", {"default": None, "multiple": True}),
-                "canny_strength": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0}),
-                "canny_video": ("VIDEO", {"default": None, "multiple": True}),
-                # Advanced settings
-                "num_interpolated_frames": ("INT", {"default": 0, "min": 0, "max": 5}),
-                "temporal_downsample_factor": ("INT", {"default": 0, "min": 0, "max": 5}),
-                "enable_auto_downsample": ("BOOLEAN", {"default": False}),
-                "auto_downsample_min_fps": ("INT", {"default": 8, "min": 0, "max": 60}),
-                "return_frames_zip": ("BOOLEAN", {"default": False}),
-                "lora_path_1": ("STRING", {"default": ""}),
-                "lora_strength_1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "lora_transformer_1": (["high", "low", "both"], {"default": "high"}),
-                "lora_path_2": ("STRING", {"default": ""}),
-                "lora_strength_2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "lora_transformer_2": (["high", "low", "both"], {"default": "high"}),
-                "lora_path_3": ("STRING", {"default": ""}),
-                "lora_strength_3": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "lora_transformer_3": (["high", "low", "both"], {"default": "high"}),
-                "lora_path_4": ("STRING", {"default": ""}),
-                "lora_strength_4": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 2.0, "step": 0.1}),
-                "lora_transformer_4": (["high", "low", "both"], {"default": "high"}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING",)
-    RETURN_NAMES = ("video_url", "frames_zip_url",)
-    OUTPUT_IS_LIST = (True, True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration/DY"
-
-    def generate_video(
-        self,
-        architecture="vace",
-        control_video=None,
-        ref_image=None,
-        turbo_mode=True,
-        prompt="",
-        negative_prompt="",
-        image_size="custom",
-        custom_width=1280,
-        custom_height=720,
-        num_frames=81,
-        frames_per_second=16,
-        num_inference_steps=4,
-        guidance_scale=1.0,
-        seed=-1,
-        sampler="uni_pc",
-        shift=5,
-        variations=1,
-        vace_mask_video=None,
-        preprocess_all_maps=True,
-        strength_vace=1.0,
-        pose_strength=0.6,
-        pose_video=None,
-        depth_strength=0.0,
-        depth_video=None,
-        normal_strength=0.0,
-        normal_video=None,
-        canny_strength=0.0,
-        canny_video=None,
-        num_interpolated_frames=0,
-        temporal_downsample_factor=0,
-        enable_auto_downsample=False,
-        auto_downsample_min_fps=8,
-        return_frames_zip=False,
-        lora_path_1="",
-        lora_strength_1=1.0,
-        lora_transformer_1="high",
-        lora_path_2="",
-        lora_strength_2=1.0,
-        lora_transformer_2="high",
-        lora_path_3="",
-        lora_strength_3=1.0,
-        lora_transformer_3="high",
-        lora_path_4="",
-        lora_strength_4=1.0,
-        lora_transformer_4="high",
-    ):
-        try:
-            if ref_image is None:
-                return ApiHandler.handle_video_generation_error(
-                    "dy-wan-fun-22", "Reference image is required."
-                )
-
-            # Upload reference image
-            ref_image_url = ImageUtils.upload_image(ref_image)
-            if not ref_image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "dy-wan-fun-22", "Failed to upload reference image"
-                )
-
-            # Build arguments
-            arguments = {
-                "ref_image_url": ref_image_url,
-                "architecture": architecture,
-                "turbo_mode": turbo_mode,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "num_frames": num_frames,
-                "frames_per_second": frames_per_second,
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": guidance_scale,
-                "sampler": sampler,
-                "shift": shift,
-                "preprocess_all_maps": preprocess_all_maps,
-                "return_frames_zip": return_frames_zip,
-                "pose_strength": pose_strength,
-                "depth_strength": depth_strength,
-                "normal_strength": normal_strength,
-                "canny_strength": canny_strength
-            }
-
-            # Set seed
-            if seed != -1:
-                arguments["seed"] = seed
-
-            # Handle image_size - use custom dimensions if provided, otherwise use aspect_ratio preset
-            if image_size == "custom":
-                arguments["image_size"] = {"width": custom_width, "height": custom_height}
-            else:
-                arguments["image_size"] = image_size
-
-            # Upload control video if provided
-            if control_video is not None:
-                control_video_url = ImageUtils.upload_file(control_video.get_stream_source())
-                if control_video_url:
-                    arguments["control_video_url"] = control_video_url
-
-            # Handle VACE strength
-            if architecture == "vace":
-                arguments["strength_vace"] = strength_vace
-
-            # Handle VACE mask video
-            if vace_mask_video is not None:
-                vace_mask_video_url = ImageUtils.upload_file(vace_mask_video.get_stream_source())
-                if vace_mask_video_url:
-                    arguments["vace_mask_video_url"] = vace_mask_video_url
-
-            # Upload and add pose video/strength if provided
-            if pose_video is not None:
-                pose_video_url = ImageUtils.upload_file(pose_video.get_stream_source())
-                if pose_video_url:
-                    arguments["pose_video_url"] = pose_video_url
-
-            # Upload and add depth video/strength if provided
-            if depth_video is not None:
-                depth_video_url = ImageUtils.upload_file(depth_video.get_stream_source())
-                if depth_video_url:
-                    arguments["depth_video_url"] = depth_video_url
-
-            # Upload and add normal video/strength if provided
-            if normal_video is not None:
-                normal_video_url = ImageUtils.upload_file(normal_video.get_stream_source())
-                if normal_video_url:
-                    arguments["normal_video_url"] = normal_video_url
-
-            # Upload and add canny video/strength if provided
-            if canny_video is not None:
-                canny_video_url = ImageUtils.upload_file(canny_video.get_stream_source())
-                if canny_video_url:
-                    arguments["canny_video_url"] = canny_video_url
-
-            # Add advanced interpolation settings if non-default
-            if num_interpolated_frames > 0:
-                arguments["num_interpolated_frames"] = num_interpolated_frames
-            if temporal_downsample_factor > 0:
-                arguments["temporal_downsample_factor"] = temporal_downsample_factor
-            if enable_auto_downsample:
-                arguments["enable_auto_downsample"] = enable_auto_downsample
-                arguments["auto_downsample_min_fps"] = auto_downsample_min_fps
-
-            # Add LoRAs if provided
-            loras = []
-            if lora_path_1:
-                loras.append({"url": lora_path_1, "strength": lora_strength_1, "transformer": lora_transformer_1})
-            if lora_path_2:
-                loras.append({"url": lora_path_2, "strength": lora_strength_2, "transformer": lora_transformer_2})
-            if lora_path_3:
-                loras.append({"url": lora_path_3, "strength": lora_strength_3, "transformer": lora_transformer_3})
-            if lora_path_4:
-                loras.append({"url": lora_path_4, "strength": lora_strength_4, "transformer": lora_transformer_4})
-            if loras:
-                arguments["loras"] = loras
-
-            # Submit to API
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/dy-wan-fun-22",
-                arguments,
-                variations
-            )
-
-            # Return list of outputs
-            video_url = [r["video"]["url"] for r in results]
-            frames_zip_url = [r.get("frames_zip", {}).get("url", "") for r in results] if return_frames_zip else [""] * len(results)
-
-            return (video_url, frames_zip_url)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("dy-wan-fun-22", str(e))
-
-
-
-class DYWanUpscalerNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-            },
-            "optional": {
-                "video": ("VIDEO", {"default": None}),
-                "video_url": ("STRING", {"default": ""}),
-                "prompt": ("STRING", {"default": "cinematic composition, realistic high-quality photo, RAW photo, masterpiece, photorealistic, 8k", "multiline": True}),
-                "negative_prompt": ("STRING", {"default": "oversaturated, overexposed, static, blurry details", "multiline": True}),
-                "strength": ("FLOAT", {"default": 0.02, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "guidance_scale": ("FLOAT", {"default": 3.5, "min": 1.0, "max": 20.0, "step": 0.1}),
-                "num_inference_steps": ("INT", {"default": 10, "min": 1, "max": 50}),
-                "seed": ("INT", {"default": -1, "min": 0, "max": 2147483647}),
-                "fps": ("INT", {"default": 24, "min": 1, "max": 120}),
-                "image_size": (["custom", "landscape_16_9", "landscape_4_3", "portrait_16_9", "portrait_4_3", "square", "square_hd"], {"default": "custom"}),
-                "custom_width": ("INT", {"default": 1920, "min": 0, "max": 8192, "step": 8}),
-                "custom_height": ("INT", {"default": 1080, "min": 0, "max": 8192, "step": 8}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    FUNCTION = "upscale_video"
-    CATEGORY = "FAL/VideoGeneration/DY"
-
-    def upscale_video(
-        self,
-        video=None,
-        video_url="",
-        prompt="cinematic composition, realistic high-quality photo, RAW photo, masterpiece, photorealistic, 8k",
-        negative_prompt="oversaturated, overexposed, static, blurry details",
-        strength=0.02,
-        guidance_scale=3.5,
-        num_inference_steps=10,
-        seed=-1,
-        fps=24,
-        image_size="custom",
-        custom_width=1920,
-        custom_height=1080
-    ):
-        try:
-            if video is None and video_url == "":
-                return ApiHandler.handle_video_generation_error(
-                    "dy-wan-upscaler", "Video input is required."
-                )
-
-            # Upload video
-            if video:
-                video_url = ImageUtils.upload_file(video.get_stream_source())
-                if not video_url:
-                    return ApiHandler.handle_video_generation_error(
-                        "dy-wan-upscaler", "Failed to upload video"
-                    )
-
-            # Build arguments
-            arguments = {
-                "video_url": video_url,
-                "prompt": prompt,
-                "negative_prompt": negative_prompt,
-                "strength": strength,
-                "guidance_scale": guidance_scale,
-                "num_inference_steps": num_inference_steps,
-                "fps": fps,
-            }
-
-            # Set seed
-            if seed != -1:
-                arguments["seed"] = seed
-
-            # Handle image_size - use custom dimensions if provided, otherwise use preset
-            if image_size == "custom":
-                arguments["image_size"] = {"width": custom_width, "height": custom_height}
-            else:
-                arguments["image_size"] = image_size
-
-            # Submit to API
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/dy-wan-upscaler",
-                arguments,
-            )
-
-            video_url = result["video"]["url"]
-            return (video_url,)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("dy-wan-upscaler", str(e))
-
-
-# =============================================================================
-# END HYPER CUSTOM DY ENDPOINTS
-# =============================================================================
-
-
-class PixverseSwapNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE", {"default": None}),
-                "mode": (["person", "object", "background"], {"default": "person"}),
-                "keyframe_id": ("INT", {"default": 1}),
-                "quality": (
-                    ["360p", "540p", "720p"],
-                    {"default": "720p"}
-                ),
-                "original_sound_switch": ("BOOLEAN", {"default": True}),
-            },
-            "optional": {
-                "video": ("VIDEO", {"default": None}),
-                "input_video_url": ("STRING", {"default": ""}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        video=None,
-        input_video_url="",
-        image=None,
-        keyframe_id=1,
-        quality="720p",
-        original_sound_switch=True,
-        mode="person"):
-        try:
-            if video is None and input_video_url is "":
-                return ApiHandler.handle_video_generation_error(
-                    "pixverse-swap", "Video or Video Frames input is required."
-                )
-            if video is None and input_video_url is not "":
-                video_url = input_video_url
-            else:
-                video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "pixverse-swap", "Failed to upload video"
-                )
-
-          
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "pixverse-swap", "Failed to upload image"
-                )
-
-            arguments={
-        "video_url": video_url,
-        "image_url": image_url,
-        "keyframe_id": keyframe_id,
-        "quality": quality,
-        "original_sound_switch": original_sound_switch,
-        "mode": mode
-    }
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/pixverse/swap",
-                arguments,
-            )
-
-            return (result["video"]["url"],)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("pixverse-swap", str(e))
-
-
-
-
-class KreaWan14bVideoToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
-                "strength": ("FLOAT", {"default": 0.85, "min": 0.0, "max": 3.0}),
-            },
-            "optional": {
-                "video": ("VIDEO", {"default": None}),
-                "input_video_url": ("STRING", {"default": ""}),
-                "seed": ("INT", {"default": 42}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        prompt="",
-        strength=0.85,
-        video=None,
-        input_video_url="",
-        seed=24,
-        enable_prompt_expansion=True,
-    ):
-        try:
-            if video is None and input_video_url is "":
-                return ApiHandler.handle_video_generation_error(
-                    "krea-wan-14b", "Video or Video URL input is required."
-                )
-            if video is None and input_video_url is not "":
-                video_url = input_video_url
-            else:
-                video_url = ImageUtils.upload_file(video.get_stream_source())
-            if not video_url:
-                return ApiHandler.handle_video_generation_error(
-                    "krea-wan-14b", "Failed to upload video"
-                )
-            arguments={
-                    "prompt": prompt,
-                    "strength": strength,
-                    "enable_prompt_expansion": enable_prompt_expansion,
-                    "video_url": video_url,
-                    "seed": seed
-                }
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/krea-wan-14b/video-to-video",
-                arguments,
-            )
-
-            return (result["video"]["url"],)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("krea-wan-14b", str(e))
-
-
-
-
-class InfinityStarTextToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "negative_prompt": ("STRING", {"default": "low quality.", "multiline": True}),
-                "aspect_ratio": (
-                    ["16:9",  "9:6","1:1"],
-                    {"default": "16:9"}
-                ),
-                "guidance_scale": ("FLOAT", {"default": 7.5, "min": 0.0, "max": 10}),
-            },
-            "optional": {
-                "tau_video": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 2}),
-                "enhance_prompt": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": 42}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    FUNCTION = "edit_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def edit_video(
-        self,
-        prompt="",
-        negative_prompt="low quality.",
-        enhance_prompt=True,
-        seed=24,
-        aspect_ratio="16:9",
-        guidance_scale=7.5,
-        tau_video=0.4,
-    ):
-        try:
-            arguments={
-                    "prompt": prompt,
-                    "negative_prompt": negative_prompt,
-                    "aspect_ratio": aspect_ratio,
-                    "guidance_scale": guidance_scale,
-                    "enhance_prompt": enhance_prompt,
-                    "tau_video": tau_video,
-                    "seed": seed
-                }
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/infinity-star/text-to-video",
-                arguments,
-            )
-
-            return (result["video"]["url"],)
-
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("infinity-star-text-to-video", str(e))
-
-
-
-class CombinedVideoGenerationNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "kling_duration": (["5", "10"], {"default": "5"}),
-                "kling_luma_aspect_ratio": (
-                    ["16:9", "9:16", "1:1"],
-                    {"default": "16:9"},
-                ),
-                "luma_loop": ("BOOLEAN", {"default": False}),
-                "veo2_aspect_ratio": (
-                    ["auto", "auto_prefer_portrait", "16:9", "9:16"],
-                    {"default": "auto"},
-                ),
-                "veo2_duration": (["5s", "6s", "7s", "8s"], {"default": "5s"}),
-                "enable_klingpro": ("BOOLEAN", {"default": True}),
-                "enable_klingmaster": ("BOOLEAN", {"default": True}),
-                "enable_minimax": ("BOOLEAN", {"default": True}),
-                "enable_luma": ("BOOLEAN", {"default": True}),
-                "enable_veo2": ("BOOLEAN", {"default": True}),
-                "enable_wanpro": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING", "STRING", "STRING", "STRING", "STRING", "STRING")
-    RETURN_NAMES = (
-        "klingpro_v1.6_video",
-        "klingmaster_v2.0_video",
-        "minimax_video",
-        "luma_video",
-        "veo2_video",
-        "wanpro_video",
+            errors.append(f"  {url} -> {type(e).__name__}: {e}")
+
+    raise RuntimeError(
+        f"All result-fetch URLs failed for fal endpoint '{endpoint}' "
+        f"(request_id={rid}).\nTried URLs:\n" + "\n".join(errors)
     )
-    FUNCTION = "generate_videos"
-    CATEGORY = "FAL/VideoGeneration"
 
-    async def generate_klingpro_video(
-        self, client, prompt, image_url, kling_duration, kling_luma_aspect_ratio
-    ):
+
+async def _submit_with_retry(client, endpoint, args, max_retries=0, retry_label=""):
+    """Submit + fetch with auto-retry on borderline content_policy_violation.
+
+    Per multiple independent reports, ByteDance/Seedance content moderation has a
+    probabilistic component — borderline inputs that fail one call may pass on the
+    next (frame-sampling variance, confidence-threshold jitter, ensemble-vote flips).
+    Retrying with backoff is the documented workaround.
+
+    - Retries ONLY on content_policy_violation (other 4xx/5xx propagate immediately).
+    - Backoff: 3s, 6s, 12s (exponential).
+    - Caller controls seed per attempt: each retry passes args as-is, so set
+      seed=-1 upstream to randomize per attempt (we already do this in _run_parallel).
+    """
+    last_error = None
+    for attempt in range(max_retries + 1):
         try:
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": kling_duration,
-                "aspect_ratio": kling_luma_aspect_ratio,
-            }
-            handler = await client.submit(
-                "fal-ai/kling-video/v1.6/pro/image-to-video", arguments=arguments
+            handler = await client.submit(endpoint, arguments=args)
+            result = await _fetch_result_with_fallbacks(handler, endpoint)
+            if attempt > 0:
+                print(f"[fal-API] {retry_label}: succeeded on retry {attempt}/{max_retries}")
+            return result
+        except RuntimeError as e:
+            msg = str(e)
+            if "content_policy_violation" not in msg.lower():
+                raise
+            last_error = e
+            if attempt >= max_retries:
+                raise
+            backoff = 3 * (2 ** attempt)
+            print(
+                f"[fal-API] {retry_label}: content_policy_violation "
+                f"(attempt {attempt + 1}/{max_retries + 1}) — retrying in {backoff}s"
             )
-            while True:
-                result = await handler.get()
-                if "video" in result and "url" in result["video"]:
-                    return result["video"]["url"]
-                elif result.get("status") == "FAILED":
-                    raise Exception("Video generation failed")
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Error generating KlingPro video: {str(e)}")
-            return "Error: Unable to generate KlingPro video."
+            await asyncio.sleep(backoff)
+    raise last_error  # unreachable in normal flow
 
-    async def generate_klingmaster_video(
-        self, client, prompt, image_url, kling_duration, kling_luma_aspect_ratio
-    ):
+
+async def _run_parallel(endpoint, base_args, count, seed, retry_on_policy=0):
+    """Fire `count` parallel requests via fal's queue API.
+
+    seed = -1: generate a fresh random seed PER call PER run. Each variation
+    differs from siblings AND from previous runs — exactly what users expect
+    when they want to "queue a few attempts and see them."
+
+    seed >= 0: deterministic. Variations get seed, seed+1, seed+2, ... so the
+    same seed value reproduces the same set of variations.
+
+    retry_on_policy: max retries per variation on content_policy_violation only.
+    """
+    client = AsyncClient(key=fal_config.get_key())
+
+    async def one(i):
+        args = dict(base_args)
+        # Each retry must pick a fresh random seed when seed=-1, so we pass a sentinel
+        # via args["seed"] = -1 and let _submit_with_retry build it per attempt below.
+        # Simpler: roll the seed here for each variation, retries reuse same args
+        # (same seed) — but with probabilistic moderation the SAME seed often clears
+        # on retry, so reusing it is fine. Borderline=jitter, not seed-dependent.
+        args["seed"] = (seed + i) if seed >= 0 else random.randint(0, 2**31 - 1)
+        result = await _submit_with_retry(
+            client, endpoint, args,
+            max_retries=retry_on_policy,
+            retry_label=f"variation {i + 1}",
+        )
+        return result["video"]["url"]
+
+    return await asyncio.gather(*(one(i) for i in range(count)))
+
+
+def _upload_image_batch(images, limit=9):
+    """Upload a ComfyUI IMAGE batch and return URLs (up to `limit`)."""
+    urls = []
+    if images is None:
+        return urls
+    if images.ndim == 4:
+        for i in range(min(images.shape[0], limit)):
+            url = ImageUtils.upload_image(images[i].unsqueeze(0))
+            if url:
+                urls.append(url)
+    else:
+        url = ImageUtils.upload_image(images.unsqueeze(0))
+        if url:
+            urls.append(url)
+    return urls
+
+
+# Fal Seedance 2.0 reference-to-video constraints (from the live OpenAPI schema).
+SEEDANCE_REF_VIDEO_MIN_SEC = 2.0
+SEEDANCE_REF_VIDEO_MAX_SEC = 15.0
+SEEDANCE_REF_AUDIO_MAX_SEC = 15.0
+SEEDANCE_REF_VIDEO_MAX_BYTES = 50 * 1024 * 1024  # 50 MB combined cap; we enforce per-file
+SEEDANCE_REF_VIDEO_MAX_LONG_DIM = 1280            # OpenAPI says ~480p-720p; 1080p+ commonly 422s
+
+
+def _probe_video_meta(path):
+    """Read duration + max dimension of a video file via OpenCV. Returns dict or None."""
+    try:
+        cap = cv2.VideoCapture(path)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 0
+        frames = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        cap.release()
+        if fps > 0 and frames > 0:
+            return {"duration": frames / fps, "width": w, "height": h, "long_dim": max(w, h)}
+    except Exception:
+        pass
+    return None
+
+
+# Backward-compatible alias used elsewhere in the module.
+def _probe_video_duration_seconds(path):
+    meta = _probe_video_meta(path)
+    return meta["duration"] if meta else None
+
+
+def _upload_video(video, min_seconds=None, max_seconds=None,
+                  max_bytes=None, max_long_dim=None):
+    """Upload a ComfyUI VIDEO with full preflight (duration + size + resolution).
+
+    All checks fail FAST with a clear, actionable message — no fal credits wasted on
+    requests we already know will be rejected by fal's queue validator.
+    """
+    if video is None:
+        return None
+    path = video.get_stream_source()
+
+    # Duration + resolution check (single OpenCV probe).
+    if any(x is not None for x in (min_seconds, max_seconds, max_long_dim)):
+        meta = _probe_video_meta(path)
+        if meta is None:
+            print(f"[fal-API] WARNING: could not probe metadata of {path}; skipping preflight checks.")
+        else:
+            d = meta["duration"]
+            if min_seconds is not None and d < min_seconds:
+                raise ValueError(
+                    f"Reference video is too short: {d:.2f}s "
+                    f"(fal requires at least {min_seconds:.0f}s combined across @Video refs)."
+                )
+            if max_seconds is not None and d > max_seconds:
+                raise ValueError(
+                    f"Reference video is too long: {d:.2f}s "
+                    f"(fal allows at most {max_seconds:.0f}s combined across @Video refs). "
+                    f"Trim the clip or split it into chunks of {max_seconds:.0f}s or less."
+                )
+            if max_long_dim is not None and meta["long_dim"] > max_long_dim:
+                raise ValueError(
+                    f"Reference video resolution is too high: {meta['width']}x{meta['height']} "
+                    f"(fal Seedance Reference expects roughly 480p-720p; longest side must be "
+                    f"at most {max_long_dim}px). Downscale the source — e.g. "
+                    f"`ffmpeg -i in.mp4 -vf scale=-2:720 -c:v libx264 -crf 23 out.mp4` — "
+                    f"or feed a 720p export."
+                )
+
+    # File size check.
+    if max_bytes is not None:
         try:
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": kling_duration,
-                "aspect_ratio": kling_luma_aspect_ratio,
-            }
-            handler = await client.submit(
-                "fal-ai/kling-video/v2/master/image-to-video", arguments=arguments
+            sz = os.path.getsize(path)
+            if sz > max_bytes:
+                raise ValueError(
+                    f"Reference video file is too large: {sz / 1024 / 1024:.1f} MB "
+                    f"(fal Seedance Reference allows at most {max_bytes / 1024 / 1024:.0f} MB). "
+                    f"Re-encode at lower bitrate or 720p — e.g. "
+                    f"`ffmpeg -i in.mp4 -vf scale=-2:720 -c:v libx264 -crf 28 out.mp4`."
+                )
+        except OSError:
+            pass
+
+    try:
+        return ImageUtils.upload_file(path)
+    except Exception as e:
+        print(f"[fal-API] failed to upload VIDEO: {e}")
+        return None
+
+
+def _upload_audio(audio, max_seconds=None):
+    """Upload a ComfyUI AUDIO dict ({waveform, sample_rate}) as a WAV file and return its URL.
+
+    If `max_seconds` is set, validates duration before upload and raises ValueError on overflow.
+    """
+    if audio is None:
+        return None
+    try:
+        import torchaudio
+        waveform = audio["waveform"]
+        sample_rate = int(audio["sample_rate"])
+        # ComfyUI AUDIO is shape (B, C, T); torchaudio.save expects (C, T).
+        if waveform.ndim == 3:
+            waveform = waveform[0]
+        elif waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0)
+
+        if max_seconds is not None:
+            duration = waveform.shape[-1] / sample_rate
+            if duration > max_seconds:
+                raise ValueError(
+                    f"Reference audio is too long: {duration:.2f}s "
+                    f"(fal Seedance Reference allows at most {max_seconds:.0f}s combined across @Audio refs)."
+                )
+
+        tmp_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
+        torchaudio.save(tmp_path, waveform.cpu(), sample_rate, format="wav")
+        try:
+            return ImageUtils.upload_file(tmp_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+    except ValueError:
+        raise  # surface validation errors to ComfyUI
+    except Exception as e:
+        print(f"[fal-API] failed to upload AUDIO: {e}")
+        return None
+
+
+def _center_crop_to_aspect(image, target_ratio):
+    """Center-crop a ComfyUI IMAGE tensor (B,H,W,C) to match `target_ratio` (w/h)."""
+    if image is None or target_ratio is None:
+        return image
+    h, w = image.shape[1], image.shape[2]
+    current = w / h
+    if abs(current - target_ratio) < 1e-3:
+        return image
+    if current > target_ratio:
+        new_w = int(round(h * target_ratio))
+        offset = (w - new_w) // 2
+        return image[:, :, offset:offset + new_w, :]
+    new_h = int(round(w / target_ratio))
+    offset = (h - new_h) // 2
+    return image[:, offset:offset + new_h, :, :]
+
+
+# ============================================================================
+# NBC-APPROVED MODELS
+# ============================================================================
+
+class Seedance2TextToVideo_NBC:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "aspect_ratio": (SEEDANCE_ASPECT, {"default": "16:9"}),
+                "duration": (SEEDANCE_DURATIONS, {"default": "5"}),
+                "resolution": (SEEDANCE_RESOLUTIONS, {"default": "720p"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
+            },
+            "optional": {
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_urls",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "generate"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # When seed = -1 (random), force ComfyUI to re-execute on every queue.
+        # Otherwise the cached result is reused and the user can't get a new variation
+        # without manually editing the seed. seed >= 0 is treated as deterministic.
+        seed = kwargs.get("seed", -1)
+        return float("nan") if seed == -1 else seed
+
+    async def generate(self, prompt, aspect_ratio, duration, resolution, generate_audio,
+                       variations, seed, retry_on_policy_violation=2):
+        args = {
+            "prompt": prompt,
+            "aspect_ratio": aspect_ratio,
+            "duration": duration,
+            "resolution": resolution,
+            "generate_audio": generate_audio,
+        }
+        return (await _run_parallel(
+            "bytedance/seedance-2.0/text-to-video", args, variations, seed,
+            retry_on_policy=retry_on_policy_violation,
+        ),)
+
+
+class Seedance2ImageToVideo_NBC:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "image": ("IMAGE",),
+                "aspect_ratio": (SEEDANCE_ASPECT, {"default": "auto"}),
+                "duration": (SEEDANCE_DURATIONS, {"default": "5"}),
+                "resolution": (SEEDANCE_RESOLUTIONS, {"default": "720p"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
+            },
+            "optional": {
+                "end_image": ("IMAGE",),
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_urls",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "generate"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # When seed = -1 (random), force ComfyUI to re-execute on every queue.
+        # Otherwise the cached result is reused and the user can't get a new variation
+        # without manually editing the seed. seed >= 0 is treated as deterministic.
+        seed = kwargs.get("seed", -1)
+        return float("nan") if seed == -1 else seed
+
+    async def generate(self, prompt, image, aspect_ratio, duration, resolution, generate_audio,
+                       variations, seed, end_image=None, retry_on_policy_violation=2):
+        args = {
+            "prompt": prompt,
+            "image_url": ImageUtils.upload_image(image),
+            "aspect_ratio": aspect_ratio,
+            "duration": duration,
+            "resolution": resolution,
+            "generate_audio": generate_audio,
+        }
+        if end_image is not None:
+            end_url = ImageUtils.upload_image(end_image)
+            if end_url:
+                args["end_image_url"] = end_url
+        return (await _run_parallel(
+            "bytedance/seedance-2.0/image-to-video", args, variations, seed,
+            retry_on_policy=retry_on_policy_violation,
+        ),)
+
+
+class Seedance2ReferenceToVideo_NBC:
+    # Endpoint id (overridable in subclasses for the enterprise tier, etc.)
+    ENDPOINT = "bytedance/seedance-2.0/reference-to-video"
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {
+                    "default": "@Image1 performs the action from @Video1",
+                    "multiline": True,
+                }),
+                "images": ("IMAGE",),
+                "aspect_ratio": (SEEDANCE_ASPECT, {"default": "16:9"}),
+                "duration": (SEEDANCE_DURATIONS, {"default": "5"}),
+                "resolution": (SEEDANCE_RESOLUTIONS, {"default": "720p"}),
+                "generate_audio": ("BOOLEAN", {"default": True}),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
+            },
+            "optional": {
+                "ref_video": ("VIDEO",),
+                "ref_audio": ("AUDIO",),
+                "ref_video_url": ("STRING", {"default": "", "multiline": False}),
+                "ref_audio_url": ("STRING", {"default": "", "multiline": False}),
+                "retry_on_policy_violation": ("INT", {"default": 2, "min": 0, "max": 5}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_urls",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "generate"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # When seed = -1 (random), force ComfyUI to re-execute on every queue.
+        # Otherwise the cached result is reused and the user can't get a new variation
+        # without manually editing the seed. seed >= 0 is treated as deterministic.
+        seed = kwargs.get("seed", -1)
+        return float("nan") if seed == -1 else seed
+
+    async def generate(self, prompt, images, aspect_ratio, duration, resolution, generate_audio,
+                       variations, seed, ref_video=None, ref_audio=None,
+                       ref_video_url="", ref_audio_url="", retry_on_policy_violation=2):
+        image_urls = _upload_image_batch(images, limit=9)
+        args = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "aspect_ratio": aspect_ratio,
+            "duration": duration,
+            "resolution": resolution,
+            "generate_audio": generate_audio,
+        }
+
+        # For each modality: socket beats URL. Connecting the socket auto-uploads.
+        # Validate duration BEFORE upload so we fail fast with a clear message
+        # instead of getting a generic 422 from fal.
+        if ref_video is not None:
+            video_url = _upload_video(
+                ref_video,
+                min_seconds=SEEDANCE_REF_VIDEO_MIN_SEC,
+                max_seconds=SEEDANCE_REF_VIDEO_MAX_SEC,
+                max_bytes=SEEDANCE_REF_VIDEO_MAX_BYTES,
+                max_long_dim=SEEDANCE_REF_VIDEO_MAX_LONG_DIM,
             )
-            while True:
-                result = await handler.get()
-                if "video" in result and "url" in result["video"]:
-                    return result["video"]["url"]
-                elif result.get("status") == "FAILED":
-                    raise Exception("Video generation failed")
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Error generating KlingMaster video: {str(e)}")
-            return "Error: Unable to generate KlingMaster video."
+        else:
+            video_url = ref_video_url.strip() or None
+        if video_url:
+            args["video_urls"] = [video_url]
 
-    async def generate_minimax_video(self, client, prompt, image_url):
-        try:
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-            }
-            handler = await client.submit(
-                "fal-ai/minimax/video-01-live/image-to-video", arguments=arguments
-            )
-            while True:
-                result = await handler.get()
-                if "video" in result and "url" in result["video"]:
-                    return result["video"]["url"]
-                elif result.get("status") == "FAILED":
-                    raise Exception("Video generation failed")
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Error generating MiniMax video: {str(e)}")
-            return "Error: Unable to generate MiniMax video."
+        if ref_audio is not None:
+            audio_url = _upload_audio(ref_audio, max_seconds=SEEDANCE_REF_AUDIO_MAX_SEC)
+        else:
+            audio_url = ref_audio_url.strip() or None
+        if audio_url:
+            args["audio_urls"] = [audio_url]
 
-    async def generate_luma_video(
-        self, client, prompt, image_url, kling_luma_aspect_ratio, luma_loop
-    ):
-        try:
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "aspect_ratio": kling_luma_aspect_ratio,
-                "loop": luma_loop,
-            }
-            handler = await client.submit(
-                "fal-ai/luma-dream-machine/ray-2/image-to-video", arguments=arguments
-            )
-            while True:
-                result = await handler.get()
-                if "video" in result and "url" in result["video"]:
-                    return result["video"]["url"]
-                elif result.get("status") == "FAILED":
-                    raise Exception("Video generation failed")
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Error generating Luma video: {str(e)}")
-            return "Error: Unable to generate Luma video."
+        return (await _run_parallel(
+            type(self).ENDPOINT, args, variations, seed,
+            retry_on_policy=retry_on_policy_violation,
+        ),)
 
-    async def generate_veo2_video(
-        self, client, prompt, image_url, aspect_ratio, duration
-    ):
-        try:
-            arguments = {
+
+class Seedance2ReferenceToVideoEnterprise_NBC(Seedance2ReferenceToVideo_NBC):
+    """Enterprise tier of Seedance 2.0 Reference-to-Video.
+
+    Identical schema and behavior to the standard NBC node, but routes to the
+    enterprise endpoint, which Legal has cleared for use with real-person likeness
+    (talent images / footage of public figures, etc.). Use this only for content
+    that has been legally cleared per NBC's standard talent-rights process —
+    standard endpoint remains the right default for everything else.
+    """
+    ENDPOINT = "bytedance/seedance-2.0/enterprise/reference-to-video"
+
+
+class KlingV3Standard_NBC:
+    """Kling V3 Standard. Auto-switches to I2V when `image` is connected, otherwise T2V."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "duration": (KLING_DURATIONS, {"default": "5"}),
+                "aspect_ratio": (KLING_ASPECT, {"default": "16:9"}),
+                "cfg_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.05}),
+                "variations": ("INT", {"default": 1, "min": 1, "max": 10}),
+                "seed": ("INT", {"default": -1, "min": -1, "max": 2**31 - 1}),
+            },
+            "optional": {
+                "image": ("IMAGE",),
+                "end_image": ("IMAGE",),
+                "negative_prompt": ("STRING", {"default": "blur, distort, and low quality", "multiline": True}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_urls",)
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "generate"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # When seed = -1 (random), force ComfyUI to re-execute on every queue.
+        # Otherwise the cached result is reused and the user can't get a new variation
+        # without manually editing the seed. seed >= 0 is treated as deterministic.
+        seed = kwargs.get("seed", -1)
+        return float("nan") if seed == -1 else seed
+
+    async def generate(self, prompt, duration, aspect_ratio, cfg_scale, variations, seed,
+                       image=None, end_image=None, negative_prompt="blur, distort, and low quality"):
+        if image is not None:
+            # I2V: API has no aspect_ratio param — output ratio = input image ratio.
+            # If user picked a specific ratio, center-crop the input image first (Flora-style).
+            target = ASPECT_RATIOS.get(aspect_ratio)
+            cropped = _center_crop_to_aspect(image, target) if target else image
+            cropped_end = _center_crop_to_aspect(end_image, target) if (end_image is not None and target) else end_image
+
+            endpoint = "fal-ai/kling-video/v3/standard/image-to-video"
+            args = {
                 "prompt": prompt,
-                "image_url": image_url,
-                "aspect_ratio": aspect_ratio,
+                "start_image_url": ImageUtils.upload_image(cropped),
                 "duration": duration,
+                "negative_prompt": negative_prompt,
+                "cfg_scale": cfg_scale,
             }
-            handler = await client.submit(
-                "fal-ai/veo2/image-to-video", arguments=arguments
-            )
-            while True:
-                result = await handler.get()
-                if "video" in result and "url" in result["video"]:
-                    return result["video"]["url"]
-                elif result.get("status") == "FAILED":
-                    raise Exception("Video generation failed")
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Error generating Veo2 video: {str(e)}")
-            return "Error: Unable to generate Veo2 video."
-
-    async def generate_wanpro_video(self, client, prompt, image_url):
-        try:
-            arguments = {
+            if cropped_end is not None:
+                end_url = ImageUtils.upload_image(cropped_end)
+                if end_url:
+                    args["end_image_url"] = end_url
+        else:
+            # T2V branch — aspect_ratio is a real API field. "auto" isn't valid here, default to 16:9.
+            endpoint = "fal-ai/kling-video/v3/standard/text-to-video"
+            args = {
                 "prompt": prompt,
-                "image_url": image_url,
-                "enable_safety_checker": True,
-                "seed": None,  # Let the API choose a random seed
+                "duration": duration,
+                "aspect_ratio": aspect_ratio if aspect_ratio != "auto" else "16:9",
+                "negative_prompt": negative_prompt,
+                "cfg_scale": cfg_scale,
             }
-
-            handler = await client.submit(
-                "fal-ai/wan-pro/image-to-video", arguments=arguments
-            )
-            while True:
-                result = await handler.get()
-                if "video" in result and "url" in result["video"]:
-                    return result["video"]["url"]
-                elif result.get("status") == "FAILED":
-                    raise Exception("Video generation failed")
-                await asyncio.sleep(1)
-        except Exception as e:
-            print(f"Error generating Wan Pro video: {str(e)}")
-            return "Error: Unable to generate Wan Pro video."
-
-    async def generate_all_videos(
-        self,
-        prompt,
-        image_url,
-        kling_duration,
-        kling_luma_aspect_ratio,
-        luma_loop,
-        veo2_aspect_ratio,
-        veo2_duration,
-        enable_klingpro,
-        enable_klingmaster,
-        enable_minimax,
-        enable_luma,
-        enable_veo2,
-        enable_wanpro,
-    ):
-        try:
-            tasks = []
-            results = [None] * 6  # Initialize results list with None values
-
-            # Create async client with the same key as the sync client
-            client = AsyncClient(key=fal_config.get_key())
-
-            # Add tasks based on enabled services
-            if enable_klingpro:
-                tasks.append(
-                    self.generate_klingpro_video(
-                        client,
-                        prompt,
-                        image_url,
-                        kling_duration,
-                        kling_luma_aspect_ratio,
-                    )
-                )
-            else:
-                tasks.append(None)
-
-            if enable_klingmaster:
-                tasks.append(
-                    self.generate_klingmaster_video(
-                        client,
-                        prompt,
-                        image_url,
-                        kling_duration,
-                        kling_luma_aspect_ratio,
-                    )
-                )
-            else:
-                tasks.append(None)
-
-            if enable_minimax:
-                tasks.append(self.generate_minimax_video(client, prompt, image_url))
-            else:
-                tasks.append(None)
-
-            if enable_luma:
-                tasks.append(
-                    self.generate_luma_video(
-                        client, prompt, image_url, kling_luma_aspect_ratio, luma_loop
-                    )
-                )
-            else:
-                tasks.append(None)
-
-            if enable_veo2:
-                tasks.append(
-                    self.generate_veo2_video(
-                        client, prompt, image_url, veo2_aspect_ratio, veo2_duration
-                    )
-                )
-            else:
-                tasks.append(None)
-
-            if enable_wanpro:
-                tasks.append(self.generate_wanpro_video(client, prompt, image_url))
-            else:
-                tasks.append(None)
-
-            # Filter out None tasks and execute them
-            valid_tasks = [task for task in tasks if task is not None]
-            if valid_tasks:
-                completed_results = await asyncio.gather(*valid_tasks)
-
-                # Place results in their correct positions
-                result_index = 0
-                for i, task in enumerate(tasks):
-                    if task is not None:
-                        results[i] = completed_results[result_index]
-                        result_index += 1
-                    else:
-                        results[i] = "Service disabled"
-
-            return results
-        except Exception as e:
-            print(f"Error in generate_all_videos: {str(e)}")
-            return ["Error: Unable to generate videos."] * 6
-
-    def generate_videos(
-        self,
-        prompt,
-        image,
-        kling_duration,
-        kling_luma_aspect_ratio,
-        luma_loop,
-        veo2_aspect_ratio,
-        veo2_duration,
-        enable_klingpro,
-        enable_klingmaster,
-        enable_minimax,
-        enable_luma,
-        enable_veo2,
-        enable_wanpro,
-    ):
-        try:
-            # Upload image once to be used by all services
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ("Error: Unable to upload image.",) * 6
-
-            # Create event loop for async operations
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-
-            # Run all video generations concurrently
-            results = loop.run_until_complete(
-                self.generate_all_videos(
-                    prompt,
-                    image_url,
-                    kling_duration,
-                    kling_luma_aspect_ratio,
-                    luma_loop,
-                    veo2_aspect_ratio,
-                    veo2_duration,
-                    enable_klingpro,
-                    enable_klingmaster,
-                    enable_minimax,
-                    enable_luma,
-                    enable_veo2,
-                    enable_wanpro,
-                )
-            )
-            loop.close()
-
-            return tuple(results)
-        except Exception as e:
-            print(f"Error in combined video generation: {str(e)}")
-            return ("Error: Unable to generate videos.",) * 6
+        return (await _run_parallel(endpoint, args, variations, seed),)
 
 
-class VideoUpscalerNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video_url": ("STRING", {"default": ""}),
-                "scale": (
-                    "FLOAT",
-                    {"default": 2.0, "min": 1.0, "max": 4.0, "step": 0.5},
-                ),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "upscale_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def upscale_video(self, video_url, scale):
-        try:
-            arguments = {"video_url": video_url, "scale": scale}
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/video-upscaler", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("video-upscaler", str(e))
-
-class UploadVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video": ("VIDEO",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("video_url",)
-    FUNCTION = "upload_video"
-    CATEGORY = "video"
-
-    def upload_video(self, video):
-        video_url = ImageUtils.upload_file(video.get_stream_source())
-        return (video_url,)
-    
-class UploadFileNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "path": ("STRING",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("file_url",)
-    FUNCTION = "upload_file"
-    CATEGORY = "video"
-
-    def upload_file(self, path):
-        file_url = ImageUtils.upload_file(path)
-        return (file_url,)
+# ============================================================================
+# UTILITIES
+# ============================================================================
 
 class LoadVideoURL:
     @classmethod
@@ -2399,951 +617,712 @@ class LoadVideoURL:
         return {
             "required": {
                 "url": ("STRING", {"default": "https://example.com/video.mp4"}),
-                "force_rate": ("INT", {"default": 0, "min": 0, "max": 60, "step": 1}),
-                "force_size": (
-                    [
-                        "Disabled",
-                        "Custom Height",
-                        "Custom Width",
-                        "Custom",
-                        "256x?",
-                        "?x256",
-                        "256x256",
-                        "512x?",
-                        "?x512",
-                        "512x512",
-                    ],
-                ),
-                "custom_width": (
-                    "INT",
-                    {"default": 512, "min": 0, "max": 8192, "step": 8},
-                ),
-                "custom_height": (
-                    "INT",
-                    {"default": 512, "min": 0, "max": 8192, "step": 8},
-                ),
-                "frame_load_cap": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 1000000, "step": 1},
-                ),
-                "skip_first_frames": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 1000000, "step": 1},
-                ),
-                "select_every_nth": (
-                    "INT",
-                    {"default": 1, "min": 1, "max": 1000000, "step": 1},
-                ),
-            },
+                "frame_load_cap": ("INT", {"default": 0, "min": 0, "max": 100000}),
+            }
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "VHS_VIDEOINFO")
     RETURN_NAMES = ("frames", "frame_count", "video_info")
-    FUNCTION = "load_video_from_url"
+    FUNCTION = "load"
     CATEGORY = "video"
 
-    def load_video_from_url(
-        self,
-        url,
-        force_rate,
-        force_size,
-        custom_width,
-        custom_height,
-        frame_load_cap,
-        skip_first_frames,
-        select_every_nth,
-    ):
-        # Download the video to a temporary file
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_file:
-            response = requests.get(url, stream=True)
-            for chunk in response.iter_content(chunk_size=8192):
-                temp_file.write(chunk)
-            temp_file_path = temp_file.name
+    def load(self, url, frame_load_cap):
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            resp = requests.get(url, stream=True)
+            for chunk in resp.iter_content(8192):
+                tmp.write(chunk)
+            path = tmp.name
+        try:
+            cap = cv2.VideoCapture(path)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            frames = []
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret or (frame_load_cap > 0 and len(frames) >= frame_load_cap):
+                    break
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frames.append(torch.from_numpy(frame).float() / 255.0)
+            cap.release()
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+        return (torch.stack(frames), len(frames), {"fps": fps, "width": w, "height": h})
 
-        # Load the video using OpenCV
-        cap = cv2.VideoCapture(temp_file_path)
 
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        duration = total_frames / fps
+class UploadVideo_fal:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"video": ("VIDEO",)}}
 
-        # Calculate target size
-        if force_size != "Disabled":
-            if force_size == "Custom Width":
-                new_height = int(height * (custom_width / width))
-                new_width = custom_width
-            elif force_size == "Custom Height":
-                new_width = int(width * (custom_height / height))
-                new_height = custom_height
-            elif force_size == "Custom":
-                new_width, new_height = custom_width, custom_height
-            else:
-                target_width, target_height = map(
-                    int, force_size.replace("?", "0").split("x")
-                )
-                if target_width == 0:
-                    new_width = int(width * (target_height / height))
-                    new_height = target_height
-                else:
-                    new_height = int(height * (target_width / width))
-                    new_width = target_width
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("video_url",)
+    FUNCTION = "upload"
+    CATEGORY = "video"
+
+    def upload(self, video):
+        return (ImageUtils.upload_file(video.get_stream_source()),)
+
+
+# ============================================================================
+# AUDIO EXTRACTION (companion to BlurFacesInVideo for full A/V Seedance pipelines)
+# ============================================================================
+
+class ExtractAudioFromVideo_NBC:
+    """Extract the audio track from a VIDEO and output as ComfyUI's standard AUDIO type.
+
+    Exact compatibility with native ComfyUI AUDIO consumers (Save Audio, the AUDIO
+    socket on Seedance Reference, etc.). Format: {waveform: float32 tensor [B,C,T],
+    sample_rate: int}.
+
+    Built specifically for the Seedance restyle workflow per fal/Segmind docs:
+    pass the same video into BOTH `video_1` (visual + baked-in timing) AND `audio_1`
+    (explicit @Audio1 lip-sync directive). This node is the bridge — wire its output
+    straight into the AUDIO socket without intermediate save/load steps.
+
+    Internally uses PyAV with libswresample for clean format conversion (handles s16,
+    s32, fltp, all standard codecs). Optional resampling and mono downmix.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+            },
+            "optional": {
+                "target_sample_rate": ("INT", {
+                    "default": 0, "min": 0, "max": 192000, "step": 1,
+                }),
+                "force_mono": ("BOOLEAN", {"default": False}),
+                "fail_silently": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio",)
+    FUNCTION = "extract"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        # Output depends on source bytes; ComfyUI can't hash a VIDEO object reliably,
+        # so re-extract on every queue. Cheap operation.
+        return float("nan")
+
+    def extract(self, video, target_sample_rate=0, force_mono=False, fail_silently=False):
+        import av
+        import numpy as np
+
+        src = video.get_stream_source()
+        # Handle BytesIO input (rare but possible per the VideoFromFile API).
+        if not isinstance(src, str):
+            tmp_in = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            with open(tmp_in, "wb") as f:
+                if hasattr(src, "read"):
+                    src.seek(0)
+                    f.write(src.read())
+            src_path = tmp_in
         else:
-            new_width, new_height = width, height
+            src_path = src
 
-        frames = []
-        frame_count = 0
+        try:
+            container = av.open(src_path)
+        except Exception as e:
+            if fail_silently:
+                return self._silent_audio()
+            raise RuntimeError(f"Could not open video for audio extraction: {e}")
 
-        for i in range(total_frames):
-            ret, frame = cap.read()
-            if not ret:
-                break
+        try:
+            audio_stream = next((s for s in container.streams if s.type == "audio"), None)
+            if audio_stream is None:
+                if fail_silently:
+                    return self._silent_audio()
+                raise ValueError(
+                    "Source video has no audio track. Either pick a clip with sound, "
+                    "or set fail_silently=True to get a 1-second mono silence stub."
+                )
 
-            if i < skip_first_frames:
+            in_rate = int(audio_stream.rate or 44100)
+            out_rate = int(target_sample_rate) if target_sample_rate > 0 else in_rate
+            in_channels = int(audio_stream.channels or 1)
+            out_channels = 1 if force_mono else in_channels
+
+            # Pick a layout PyAV understands. Channels >2 keeps source layout.
+            if out_channels == 1:
+                out_layout = "mono"
+            elif out_channels == 2:
+                out_layout = "stereo"
+            else:
+                out_layout = audio_stream.layout.name if audio_stream.layout else "stereo"
+
+            # Resample to clean planar float, target rate, target layout. libswresample
+            # handles all the fixed/float, planar/packed, channel-layout mess.
+            resampler = av.AudioResampler(format="fltp", layout=out_layout, rate=out_rate)
+
+            chunks = []
+            for frame in container.decode(audio=0):
+                for rf in resampler.resample(frame):
+                    chunks.append(rf.to_ndarray())  # shape (C, T) for planar
+            # Flush
+            for rf in resampler.resample(None):
+                chunks.append(rf.to_ndarray())
+
+            if not chunks:
+                if fail_silently:
+                    return self._silent_audio(rate=out_rate, channels=out_channels)
+                raise ValueError("No audio frames could be decoded from source.")
+
+            arr = np.concatenate(chunks, axis=-1)  # (C, T)
+            if arr.ndim == 1:
+                arr = arr[None, :]
+            # Force float32 in [-1, 1]; PyAV's fltp output is already float32 normalized.
+            arr = arr.astype(np.float32, copy=False)
+
+            # ComfyUI AUDIO is shape (B, C, T) with B=1 typically.
+            waveform = torch.from_numpy(arr).unsqueeze(0).contiguous()
+
+            duration = arr.shape[-1] / out_rate
+            print(f"[fal-API] ExtractAudioFromVideo: {arr.shape[0]}ch x {arr.shape[-1]} samples "
+                  f"({duration:.2f}s @ {out_rate}Hz)")
+
+            return ({"waveform": waveform, "sample_rate": out_rate},)
+        finally:
+            container.close()
+
+    def _silent_audio(self, rate=44100, channels=1, seconds=1.0):
+        """Return a tiny silent AUDIO stub. Used when fail_silently=True and source
+        has no audio — keeps the workflow flowing without raising."""
+        import numpy as np
+        n_samples = max(1, int(rate * seconds))
+        arr = np.zeros((max(1, channels), n_samples), dtype=np.float32)
+        waveform = torch.from_numpy(arr).unsqueeze(0).contiguous()
+        return ({"waveform": waveform, "sample_rate": rate},)
+
+
+# ============================================================================
+# FACE BLUR (preprocess to bypass face-detection content filters)
+# ============================================================================
+
+# YuNet face detector — production-grade CNN that handles frontal/profile/3-quarter/
+# tilted/occluded faces. Built into cv2 (>=4.5.4). The ONNX model is ~340 KB, fetched
+# once and cached in the package's models/ folder.
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
+
+
+def _yunet_model_path():
+    """Cache the YuNet ONNX next to the package so the user doesn't have to manage it."""
+    pkg_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    models_dir = os.path.join(pkg_dir, "models")
+    os.makedirs(models_dir, exist_ok=True)
+    return os.path.join(models_dir, YUNET_FILENAME)
+
+
+def _ensure_yunet_model():
+    path = _yunet_model_path()
+    if os.path.exists(path) and os.path.getsize(path) > 100_000:
+        return path
+    print(f"[fal-API] Downloading YuNet face detector (one-time, ~340 KB) ...")
+    resp = requests.get(YUNET_URL, stream=True, timeout=60)
+    resp.raise_for_status()
+    with open(path, "wb") as f:
+        for chunk in resp.iter_content(1 << 16):
+            f.write(chunk)
+    print(f"[fal-API] YuNet cached at {path}")
+    return path
+
+
+def _detect_faces_yunet(detector, frame_bgr):
+    """Run YuNet on a BGR frame. Returns list of dicts:
+        {"box": (x, y, w, h), "mouth": (x1, y1, x2, y2) or None}
+    sorted left-to-right by box.x.
+
+    The mouth region is derived from YuNet's 5-point landmarks (right + left mouth
+    corners). It's intentionally generous (2x mouth-corner distance wide, 1x tall,
+    biased slightly downward) so that jaw motion is included — that's the data
+    Seedance reads to drive lip-sync.
+    """
+    h_img, w_img = frame_bgr.shape[:2]
+    detector.setInputSize((w_img, h_img))
+    ret_val, faces = detector.detect(frame_bgr)
+    if faces is None or len(faces) == 0:
+        return []
+    out = []
+    for f in faces:
+        x = max(0, int(round(f[0])))
+        y = max(0, int(round(f[1])))
+        fw = max(1, int(round(f[2])))
+        fh = max(1, int(round(f[3])))
+        # YuNet landmarks (15-element row): box[0:4], r_eye[4:6], l_eye[6:8],
+        # nose[8:10], r_mouth[10:12], l_mouth[12:14], score[14].
+        rmx, rmy = float(f[10]), float(f[11])
+        lmx, lmy = float(f[12]), float(f[13])
+        mouth = None
+        if rmx > 0 and lmx > 0 and rmy > 0 and lmy > 0:
+            cx = (rmx + lmx) / 2.0
+            cy = (rmy + lmy) / 2.0
+            corner_dist = abs(rmx - lmx)
+            mw = corner_dist * 2.0  # box ~ 2x wider than mouth corners
+            mh = corner_dist * 1.0  # ~ as tall, captures jaw motion
+            cy_adj = cy + corner_dist * 0.2  # bias down toward jaw
+            mx1 = max(0, int(round(cx - mw / 2)))
+            mx2 = min(w_img, int(round(cx + mw / 2)))
+            my1 = max(0, int(round(cy_adj - mh / 2)))
+            my2 = min(h_img, int(round(cy_adj + mh / 2)))
+            if mx2 > mx1 and my2 > my1:
+                mouth = (mx1, my1, mx2, my2)
+        out.append({"box": (x, y, fw, fh), "mouth": mouth})
+    out.sort(key=lambda d: d["box"][0])
+    return out
+
+
+class BlurFacesInVideo_NBC:
+    """Detect faces in a VIDEO and blur all of them, or just specific ones by index.
+    Uses YuNet (CNN, handles profile / 3-quarter / side / occluded faces).
+
+    Use case: bypass face-detection-based content filters (e.g. Seedance Reference's
+    likeness filter) by removing recognizable faces from the source video. The
+    composition, motion, and timing are preserved — Seedance restyles the blurred
+    regions into clay along with everything else.
+
+    Workflow:
+      1. Connect LoadVideo → `video`. Run with mode="all" to blur every face.
+      2. Look at the `preview_frame` IMAGE output: faces are boxed + labeled #0,
+         #1, #2 (left-to-right in the first frame).
+      3. For surgical blur, switch mode="specific" and set blur_indices, e.g. "0"
+         (or "0,2" for multiple).
+      4. Wire `video` output straight into Seedance Reference's `ref_video`.
+
+    Tracking: in "specific" mode, faces in subsequent frames are matched to the
+    first-frame indices by left-to-right ordering. Works well for static-camera
+    footage. For tricky shots, use mode="all".
+
+    Tuning if a face is missed:
+      - Lower `confidence` (default 0.6) toward 0.4-0.5 — more aggressive detection.
+      - Increase `padding` if the box is tight and the blur leaves edges visible.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": ("VIDEO",),
+                "mode": (["all", "specific"], {"default": "all"}),
+                "blur_indices": ("STRING", {"default": "0"}),
+                "blur_strength": ("INT", {"default": 51, "min": 5, "max": 151, "step": 2}),
+                "padding": ("INT", {"default": 20, "min": 0, "max": 200}),
+                "confidence": ("FLOAT", {"default": 0.6, "min": 0.3, "max": 0.95, "step": 0.05}),
+                "preserve_mouth": ("BOOLEAN", {"default": True}),
+                "blur_method": (["mosaic", "gaussian", "noise"], {"default": "mosaic"}),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO", "IMAGE")
+    RETURN_NAMES = ("video", "preview_frame")
+    FUNCTION = "blur"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def blur(self, video, mode, blur_indices, blur_strength, padding, confidence,
+             preserve_mouth=True, blur_method="mosaic"):
+        import av
+        from comfy_api.latest._input_impl.video_types import VideoFromFile
+
+        try:
+            indices_to_blur = {int(x.strip()) for x in blur_indices.split(",") if x.strip()}
+        except ValueError:
+            indices_to_blur = {0}
+
+        if blur_strength % 2 == 0:
+            blur_strength += 1
+
+        src = video.get_stream_source()
+        if not isinstance(src, str):
+            tmp_in = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False).name
+            with open(tmp_in, "wb") as f:
+                if hasattr(src, "read"):
+                    src.seek(0)
+                    f.write(src.read())
+            src_path = tmp_in
+        else:
+            src_path = src
+
+        cap = cv2.VideoCapture(src_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open video for face blur: {src_path}")
+
+        fps = cap.get(cv2.CAP_PROP_FPS) or 24.0
+        w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        # Initialize YuNet with the actual frame size.
+        model_path = _ensure_yunet_model()
+        detector = cv2.FaceDetectorYN.create(
+            model=model_path,
+            config="",
+            input_size=(w, h),
+            score_threshold=float(confidence),
+            nms_threshold=0.3,
+            top_k=5000,
+        )
+
+        out_dir = folder_paths.get_temp_directory()
+        os.makedirs(out_dir, exist_ok=True)
+        ts = int(time.time() * 1000)
+        out_path = os.path.join(out_dir, f"blurfaces_{ts}.mp4")
+
+        from fractions import Fraction
+        rate = Fraction(round(fps * 1000), 1000)
+
+        container = av.open(out_path, mode="w")
+        stream = container.add_stream("libx264", rate=rate)
+        stream.width = w
+        stream.height = h
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "20", "preset": "veryfast"}
+
+        # Audio passthrough: open the source separately to copy audio packets without
+        # re-encoding (fast, lossless). Skip silently if the source has no audio.
+        audio_in_container = None
+        audio_in_stream = None
+        audio_out_stream = None
+        try:
+            audio_in_container = av.open(src_path)
+            audio_in_stream = next(
+                (s for s in audio_in_container.streams if s.type == "audio"), None
+            )
+            if audio_in_stream is not None:
+                # PyAV 14+ uses add_stream_from_template (older `template=` kwarg removed).
+                audio_out_stream = container.add_stream_from_template(audio_in_stream)
+        except Exception as e:
+            print(f"[fal-API] BlurFacesInVideo: audio passthrough skipped ({e})")
+            if audio_in_container is not None:
+                audio_in_container.close()
+                audio_in_container = None
+            audio_in_stream = None
+            audio_out_stream = None
+
+        def _apply_obscuring(roi):
+            """Three obscuring methods, picked via blur_method. The choice matters because
+            Seedance reads its reference VISUALLY: a smooth gray blob can be interpreted
+            as 'render this region blank in the output' (the bake-in failure). Mosaic
+            and noise are CLEARLY stylized — the model reads them as existing visual
+            treatments to restyle, not as voids."""
+            if roi.size == 0:
+                return roi
+            if blur_method == "mosaic":
+                # Pixelate: downsample then nearest-upsample. Block size scales with strength.
+                rh, rw = roi.shape[:2]
+                block = max(4, blur_strength // 3)
+                small = cv2.resize(
+                    roi, (max(1, rw // block), max(1, rh // block)),
+                    interpolation=cv2.INTER_LINEAR,
+                )
+                return cv2.resize(small, (rw, rh), interpolation=cv2.INTER_NEAREST)
+            if blur_method == "noise":
+                # High-frequency noise mixed with the local color so it's NOT featureless;
+                # Seedance can't interpret it as "leave this blank".
+                noise = np.random.randint(0, 255, roi.shape, dtype=np.uint8)
+                base = cv2.GaussianBlur(roi, (blur_strength, blur_strength), 0)
+                return cv2.addWeighted(noise, 0.55, base, 0.45, 0)
+            # gaussian (legacy)
+            return cv2.GaussianBlur(roi, (blur_strength, blur_strength), 0)
+
+        def _blur_face_keep_mouth(frame, face_box, mouth_box):
+            """Save mouth pixels first, obscure the face region, restore the mouth.
+            Kills identifying features (eyes/nose/cheeks/jawline) while keeping mouth
+            motion data so Seedance reads lip-sync from the reference."""
+            x, y, fw, fh = face_box
+            mouth_pixels = None
+            if preserve_mouth and mouth_box is not None:
+                mx1, my1, mx2, my2 = mouth_box
+                mouth_pixels = frame[my1:my2, mx1:mx2].copy()
+
+            x1 = max(0, x - padding)
+            y1 = max(0, y - padding)
+            x2 = min(frame.shape[1], x + fw + padding)
+            y2 = min(frame.shape[0], y + fh + padding)
+            roi = frame[y1:y2, x1:x2]
+            if roi.size > 0:
+                frame[y1:y2, x1:x2] = _apply_obscuring(roi)
+
+            if mouth_pixels is not None and mouth_pixels.size > 0:
+                mx1, my1, mx2, my2 = mouth_box
+                frame[my1:my2, mx1:mx2] = mouth_pixels
+
+        preview_frame_bgr = None
+        frame_idx = 0
+        total_faces_blurred = 0
+        audio_packets_copied = 0
+        try:
+            while True:
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                faces = _detect_faces_yunet(detector, frame)
+
+                if frame_idx == 0:
+                    preview_frame_bgr = frame.copy()
+                    for i, det in enumerate(faces):
+                        x, y, fw, fh = det["box"]
+                        will_blur = (mode == "all") or (i in indices_to_blur)
+                        color = (0, 0, 255) if will_blur else (0, 200, 0)  # red=blur, green=keep
+                        cv2.rectangle(preview_frame_bgr, (x, y), (x + fw, y + fh), color, 3)
+                        # Mouth-preserve region (yellow), if detected and we're keeping it.
+                        if preserve_mouth and det["mouth"] is not None and will_blur:
+                            mx1, my1, mx2, my2 = det["mouth"]
+                            cv2.rectangle(preview_frame_bgr, (mx1, my1), (mx2, my2), (0, 255, 255), 2)
+                        label = f"#{i}"
+                        cv2.rectangle(preview_frame_bgr, (x, y - 30), (x + 55, y), color, -1)
+                        cv2.putText(
+                            preview_frame_bgr, label, (x + 6, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
+                        )
+
+                for i, det in enumerate(faces):
+                    if mode == "all" or i in indices_to_blur:
+                        _blur_face_keep_mouth(frame, det["box"], det["mouth"])
+                        total_faces_blurred += 1
+
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                av_frame = av.VideoFrame.from_ndarray(rgb, format="rgb24")
+                for packet in stream.encode(av_frame):
+                    container.mux(packet)
+                frame_idx += 1
+
+            for packet in stream.encode():
+                container.mux(packet)
+
+            # Audio passthrough: demux source audio packets and remux into output.
+            # template= reuses the input codec/timebase, so packets pass through as-is.
+            if audio_in_container is not None and audio_in_stream is not None and audio_out_stream is not None:
+                try:
+                    for packet in audio_in_container.demux(audio_in_stream):
+                        if packet.dts is None:
+                            continue
+                        packet.stream = audio_out_stream
+                        container.mux(packet)
+                        audio_packets_copied += 1
+                except Exception as e:
+                    print(f"[fal-API] audio remux warning: {e}")
+        finally:
+            container.close()
+            cap.release()
+            if audio_in_container is not None:
+                try:
+                    audio_in_container.close()
+                except Exception:
+                    pass
+
+        audio_msg = f", audio: {audio_packets_copied} packets copied" if audio_in_stream is not None else ", audio: none in source"
+        print(f"[fal-API] BlurFacesInVideo: processed {frame_idx} frames, "
+              f"blurred {total_faces_blurred} face regions{audio_msg}, output -> {out_path}")
+
+        # Build the IMAGE preview tensor (B,H,W,C) float in [0,1].
+        if preview_frame_bgr is None:
+            preview_frame_bgr = np.zeros((max(h, 1), max(w, 1), 3), dtype=np.uint8)
+        rgb_preview = cv2.cvtColor(preview_frame_bgr, cv2.COLOR_BGR2RGB)
+        preview_tensor = torch.from_numpy(rgb_preview.astype(np.float32) / 255.0).unsqueeze(0)
+
+        return (VideoFromFile(out_path), preview_tensor)
+
+
+def _grid_layout(n):
+    """Pick a sensible (cols, rows) grid for n cells: prefer slightly wider than tall."""
+    if n <= 1:
+        return (1, 1)
+    if n == 2:
+        return (2, 1)
+    if n <= 4:
+        return (2, 2)
+    if n <= 6:
+        return (3, 2)
+    if n <= 9:
+        return (3, 3)
+    cols = math.ceil(math.sqrt(n))
+    rows = math.ceil(n / cols)
+    return (cols, rows)
+
+
+def _build_grid_video(paths, out_path, cell_w=480, cell_h=270, fps=24):
+    """Tile multiple videos side-by-side into a single h264 mp4 for at-a-glance preview.
+    Each cell labeled with its index (#00, #01, ...) so the user can map back to the
+    individual file in the output folder. No audio in the grid (use individual files
+    for that). Returns out_path on success or None on failure."""
+    import av  # PyAV is bundled with modern ComfyUI for video work
+
+    if not paths:
+        return None
+
+    cols, rows = _grid_layout(len(paths))
+    grid_w, grid_h = cols * cell_w, rows * cell_h
+
+    caps = []
+    durations = []
+    try:
+        for p in paths:
+            cap = cv2.VideoCapture(p)
+            if not cap.isOpened():
+                cap.release()
                 continue
+            f = cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0
+            r = cap.get(cv2.CAP_PROP_FPS) or fps
+            caps.append(cap)
+            durations.append((f / r) if r > 0 else 0)
 
-            if (i - skip_first_frames) % select_every_nth != 0:
+        if not caps or not any(d > 0 for d in durations):
+            return None
+
+        target_dur = min(d for d in durations if d > 0)
+        target_frames = max(1, int(target_dur * fps))
+
+        # Encode with h264 via PyAV — produces standard MP4 that plays inline in ComfyUI.
+        from fractions import Fraction
+        rate = Fraction(round(fps * 1000), 1000)
+        container = av.open(out_path, mode="w")
+        stream = container.add_stream("libx264", rate=rate)
+        stream.width = grid_w
+        stream.height = grid_h
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "23", "preset": "veryfast"}
+
+        for fi in range(target_frames):
+            canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+            for i, cap in enumerate(caps):
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+                frame = cv2.resize(frame, (cell_w, cell_h), interpolation=cv2.INTER_AREA)
+                # Cell label so user can match grid tiles to individual files (#00, #01, ...)
+                cv2.rectangle(frame, (5, 5), (70, 30), (0, 0, 0), -1)
+                cv2.putText(
+                    frame, f"#{i:02d}", (12, 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA,
+                )
+                row = i // cols
+                col = i % cols
+                y, x = row * cell_h, col * cell_w
+                # cv2 reads BGR; convert to RGB for PyAV.
+                canvas[y:y + cell_h, x:x + cell_w] = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
+            av_frame = av.VideoFrame.from_ndarray(canvas, format="rgb24")
+            for packet in stream.encode(av_frame):
+                container.mux(packet)
+
+        # Flush the encoder.
+        for packet in stream.encode():
+            container.mux(packet)
+        container.close()
+        return out_path
+    except Exception as e:
+        print(f"[fal-API] grid build failed: {e}")
+        return None
+    finally:
+        for cap in caps:
+            try:
+                cap.release()
+            except Exception:
+                pass
+
+
+class PreviewVideosFromURLs:
+    """Download fal video URLs to ComfyUI's output folder and preview the first inline.
+    All variations are saved with sequential numbering (_00, _01, ...). Open the
+    output folder to view individual files at full resolution."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video_urls": ("STRING", {"forceInput": True}),
+                "filename_prefix": ("STRING", {"default": "fal_video"}),
+                "save_to_output": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("file_paths",)
+    OUTPUT_IS_LIST = (True,)
+    INPUT_IS_LIST = True
+    OUTPUT_NODE = True
+    FUNCTION = "preview"
+    CATEGORY = "FAL/NBC_Approved"
+
+    @classmethod
+    def IS_CHANGED(cls, **kwargs):
+        return float("nan")
+
+    def preview(self, video_urls, filename_prefix, save_to_output):
+        def _scalar(x, default):
+            return (x[0] if x else default) if isinstance(x, list) else x
+
+        filename_prefix = _scalar(filename_prefix, "fal_video")
+        save_to_output = _scalar(save_to_output, True)
+
+        out_dir = folder_paths.get_output_directory() if save_to_output else folder_paths.get_temp_directory()
+        os.makedirs(out_dir, exist_ok=True)
+        ts = int(time.time() * 1000)
+        type_label = "output" if save_to_output else "temp"
+        paths = []
+        previews = []
+
+        for i, url in enumerate(video_urls or []):
+            if not url:
                 continue
+            filename = f"{filename_prefix}_{ts}_{i:02d}.mp4"
+            full_path = os.path.join(out_dir, filename)
+            try:
+                resp = requests.get(url, stream=True, timeout=300)
+                resp.raise_for_status()
+                with open(full_path, "wb") as f:
+                    for chunk in resp.iter_content(1 << 16):
+                        f.write(chunk)
+            except Exception as e:
+                print(f"[fal-API] download failed for {url}: {e}")
+                continue
+            paths.append(full_path)
+            previews.append({"filename": filename, "subfolder": "", "type": type_label})
 
-            if force_size != "Disabled":
-                frame = cv2.resize(frame, (new_width, new_height))
-
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = torch.from_numpy(frame).float() / 255.0
-            frames.append(frame)
-
-            frame_count += 1
-
-            if frame_load_cap > 0 and frame_count >= frame_load_cap:
-                break
-
-        cap.release()
-        os.unlink(temp_file_path)
-
-        frames = torch.stack(frames)
-
-        video_info = {
-            "source_fps": fps,
-            "source_frame_count": total_frames,
-            "source_duration": duration,
-            "source_width": width,
-            "source_height": height,
-            "loaded_fps": fps if force_rate == 0 else force_rate,
-            "loaded_frame_count": frame_count,
-            "loaded_duration": frame_count / (fps if force_rate == 0 else force_rate),
-            "loaded_width": new_width,
-            "loaded_height": new_height,
-        }
-
-        return (frames, frame_count, video_info)
-
-
-class SeedanceImageToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
         return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "resolution": (["480p", "720p"], {"default": "720p"}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "camera_fixed": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
-            },
+            "ui": {"images": previews[:1], "animated": (True,)},
+            "result": (paths,),
         }
 
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
 
-    def generate_video(self, prompt, image, resolution, duration, camera_fixed, seed=-1):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "fal-ai/bytedance/seedance/v1/lite/image-to-video",
-                    "Failed to upload image",
-                )
+# ============================================================================
+# REGISTRATION
+# ============================================================================
 
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "resolution": resolution,
-                "duration": duration,
-                "camera_fixed": camera_fixed,
-            }
-
-            # Only add seed if it's not -1 (random)
-            if seed != -1:
-                arguments["seed"] = seed
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/bytedance/seedance/v1/lite/image-to-video", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "fal-ai/bytedance/seedance/v1/lite/image-to-video", str(e)
-            )
-
-
-class SeedanceTextToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "aspect_ratio": (["16:9", "4:3", "1:1", "9:21"], {"default": "16:9"}),
-                "resolution": (["480p", "720p"], {"default": "720p"}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "camera_fixed": ("BOOLEAN", {"default": False}),
-            },
-            "optional": {
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, aspect_ratio, resolution, duration, camera_fixed, seed=-1):
-        try:
-            arguments = {
-                "prompt": prompt,
-                "aspect_ratio": aspect_ratio,
-                "resolution": resolution,
-                "duration": duration,
-                "camera_fixed": camera_fixed,
-            }
-
-            # Only add seed if it's not -1 (random)
-            if seed != -1:
-                arguments["seed"] = seed
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/bytedance/seedance/v1/lite/text-to-video", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "fal-ai/bytedance/seedance/v1/lite/text-to-video", str(e)
-            )
-
-
-class SeedanceProImageToVideoNode:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "duration": (["2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12",], {"default": "5"}),
-            },
-            "optional": {
-                "end_image": ("IMAGE",),
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-                "cfg_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1})
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, duration, end_image=None, negative_prompt="", cfg_scale=0.5, variations=1):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "fal-ai/bytedance/seedance/v1/pro/image-to-video",
-                    "Failed to upload image",
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": duration,
-                "negative_prompt": negative_prompt,
-                "cfg_scale": cfg_scale
-            }
-
-            # Handle optional End image
-            if end_image is not None:
-                end_image_url = ImageUtils.upload_image(end_image)
-                if end_image_url:
-                    arguments["end_image_url"] = end_image_url
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "seedance/v1/pro/image-to-video", "Failed to upload end image"
-                    )
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/bytedance/seedance/v1/pro/image-to-video", arguments, variations
-            )
-
-            # Return list of video URLs
-            return ([r["video"]["url"] for r in results],)
-        
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "fal-ai/bytedance/seedance/v1/pro/image-to-video", str(e)
-            )
-
-
-class Veo3Node:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-                "duration": (["8s"], {"default": "8s"}),
-            },
-            "optional": {
-                "negative_prompt": ("STRING", {"default": "", "multiline": True}),
-                "enhance_prompt": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
-                "generate_audio": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(
-        self,
-        prompt,
-        aspect_ratio,
-        duration,
-        negative_prompt="",
-        enhance_prompt=True,
-        seed=-1,
-        generate_audio=True,
-    ):
-        arguments = {
-            "prompt": prompt,
-            "aspect_ratio": aspect_ratio,
-            "duration": duration,
-            "negative_prompt": negative_prompt,
-            "enhance_prompt": enhance_prompt,
-            "generate_audio": generate_audio,
-        }
-
-        if seed != -1:
-            arguments["seed"] = seed
-
-        try:
-            result = ApiHandler.submit_and_get_result("fal-ai/veo3", arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error("veo3", str(e))
-
-
-class FalKling21ProImageToVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "duration": (["5", "10"], {"default": "5"}),
-            },
-            "optional": {
-                "negative_prompt": ("STRING", {"default": "blur, distort, and low quality", "multiline": True}),
-                "cfg_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "tail_image": ("IMAGE",),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, duration, negative_prompt="blur, distort, and low quality", cfg_scale=0.5, tail_image=None):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "kling-video/v2.1/pro", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": duration,
-                "negative_prompt": negative_prompt,
-                "cfg_scale": cfg_scale,
-            }
-
-            # Handle optional tail image
-            if tail_image is not None:
-                tail_image_url = ImageUtils.upload_image(tail_image)
-                if tail_image_url:
-                    arguments["tail_image_url"] = tail_image_url
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v2.1/pro", "Failed to upload tail image"
-                    )
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/kling-video/v2.1/pro/image-to-video", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v2.1/pro", str(e)
-            )
-
-
-class FalKling25TurboProImageToVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-                "duration": (["5", "10"], {"default": "5"}),
-            },
-            "optional": {
-                "negative_prompt": ("STRING", {"default": "blur, distort, and low quality", "multiline": True}),
-                "cfg_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "tail_image": ("IMAGE",),
-                "variations": ("INT", {"default": 1, "min": 1, "max": 10, "step": 1})
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    OUTPUT_IS_LIST = (True,)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, duration, negative_prompt="blur, distort, and low quality", cfg_scale=0.5, tail_image=None, variations=1):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "kling-video/v2.5-turbo/pro", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "duration": duration,
-                "negative_prompt": negative_prompt,
-                "cfg_scale": cfg_scale,
-            }
-
-            # Handle optional tail image
-            if tail_image is not None:
-                tail_image_url = ImageUtils.upload_image(tail_image)
-                if tail_image_url:
-                    arguments["tail_image_url"] = tail_image_url
-                else:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v2.5-turbo/pro", "Failed to upload tail image"
-                    )
-
-            results = ApiHandler.submit_multiple_and_get_results(
-                "fal-ai/kling-video/v2.5-turbo/pro/image-to-video", arguments, variations
-            )
-
-            # Return list of video URLs
-            return ([r["video"]["url"] for r in results],)
-            
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v2.5-turbo/pro", str(e)
-            )
-
-
-class FalKling26ProVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "duration": (["5", "10"], {"default": "5"}),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-                "aspect_ratio": (["16:9", "9:16", "1:1"], {"default": "16:9"}),
-                "negative_prompt": ("STRING", {"default": "blur, distort, and low quality", "multiline": True}),
-                "cfg_scale": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.1}),
-                "generate_audio": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, duration, image=None, aspect_ratio="16:9", negative_prompt="blur, distort, and low quality", cfg_scale=0.5, generate_audio=True):
-        try:
-            # Conditional routing based on whether image is provided
-            if image is None:
-                # T2V mode: Use text-to-video endpoint
-                endpoint = "fal-ai/kling-video/v2.6/pro/text-to-video"
-                arguments = {
-                    "prompt": prompt,
-                    "duration": duration,
-                    "aspect_ratio": aspect_ratio,
-                    "negative_prompt": negative_prompt,
-                    "cfg_scale": cfg_scale,
-                    "generate_audio": generate_audio,
-                }
-            else:
-                # I2V mode: Use image-to-video endpoint
-                image_url = ImageUtils.upload_image(image)
-                if not image_url:
-                    return ApiHandler.handle_video_generation_error(
-                        "kling-video/v2.6/pro", "Failed to upload image"
-                    )
-                endpoint = "fal-ai/kling-video/v2.6/pro/image-to-video"
-                arguments = {
-                    "prompt": prompt,
-                    "image_url": image_url,
-                    "duration": duration,
-                    "negative_prompt": negative_prompt,
-                    "generate_audio": generate_audio,
-                }
-
-            result = ApiHandler.submit_and_get_result(endpoint, arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "kling-video/v2.6/pro", str(e)
-            )
-
-
-class FalWan26Video:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "duration": (["5", "10", "15"], {"default": "5"}),
-            },
-            "optional": {
-                "image": ("IMAGE",),
-                "audio_url": ("STRING", {"default": ""}),
-                "aspect_ratio": (["16:9", "9:16", "1:1", "4:3", "3:4"], {"default": "16:9"}),
-                "resolution": (["720p", "1080p"], {"default": "1080p"}),
-                "negative_prompt": ("STRING", {"default": "low resolution, error, worst quality, low quality, defects", "multiline": True}),
-                "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
-                "multi_shots": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
-                "enable_safety_checker": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, duration, image=None, audio_url="", aspect_ratio="16:9", resolution="1080p", negative_prompt="low resolution, error, worst quality, low quality, defects", enable_prompt_expansion=True, multi_shots=True, seed=-1, enable_safety_checker=True):
-        try:
-            # Conditional routing based on whether image is provided
-            if image is None:
-                # T2V mode: Use text-to-video endpoint
-                endpoint = "wan/v2.6/text-to-video"
-                arguments = {
-                    "prompt": prompt,
-                    "duration": duration,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "negative_prompt": negative_prompt,
-                    "enable_prompt_expansion": enable_prompt_expansion,
-                    "multi_shots": multi_shots,
-                    "enable_safety_checker": enable_safety_checker,
-                }
-            else:
-                # I2V mode: Use image-to-video endpoint
-                image_url = ImageUtils.upload_image(image)
-                if not image_url:
-                    return ApiHandler.handle_video_generation_error(
-                        "wan/v2.6", "Failed to upload image"
-                    )
-                endpoint = "wan/v2.6/image-to-video"
-                arguments = {
-                    "prompt": prompt,
-                    "image_url": image_url,
-                    "duration": duration,
-                    "resolution": resolution,
-                    "negative_prompt": negative_prompt,
-                    "enable_prompt_expansion": enable_prompt_expansion,
-                    "multi_shots": multi_shots,
-                    "enable_safety_checker": enable_safety_checker,
-                }
-
-            # Add optional audio URL if provided
-            if audio_url and audio_url.strip():
-                arguments["audio_url"] = audio_url.strip()
-
-            # Add seed if specified (not -1)
-            if seed != -1:
-                arguments["seed"] = seed
-
-            result = ApiHandler.submit_and_get_result(endpoint, arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "wan/v2.6", str(e)
-            )
-
-
-class FalWan26ReferenceToVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "Dance battle between @Video1 and @Video2.", "multiline": True}),
-                "video1_url": ("STRING", {"default": ""}),
-            },
-            "optional": {
-                "video2_url": ("STRING", {"default": ""}),
-                "video3_url": ("STRING", {"default": ""}),
-                "aspect_ratio": (["16:9", "9:16", "1:1", "4:3", "3:4"], {"default": "16:9"}),
-                "resolution": (["720p", "1080p"], {"default": "1080p"}),
-                "duration": (["5", "10"], {"default": "5"}),
-                "negative_prompt": ("STRING", {"default": "low resolution, error, worst quality, low quality, defects", "multiline": True}),
-                "enable_prompt_expansion": ("BOOLEAN", {"default": True}),
-                "multi_shots": ("BOOLEAN", {"default": True}),
-                "seed": ("INT", {"default": -1, "min": -1, "max": 2147483647}),
-                "enable_safety_checker": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, video1_url, video2_url="", video3_url="", aspect_ratio="16:9", resolution="1080p", duration="5", negative_prompt="low resolution, error, worst quality, low quality, defects", enable_prompt_expansion=True, multi_shots=True, seed=-1, enable_safety_checker=True):
-        try:
-            # Build video_urls list from provided URLs
-            video_urls = []
-            if video1_url and video1_url.strip():
-                video_urls.append(video1_url.strip())
-            if video2_url and video2_url.strip():
-                video_urls.append(video2_url.strip())
-            if video3_url and video3_url.strip():
-                video_urls.append(video3_url.strip())
-
-            if not video_urls:
-                return ApiHandler.handle_video_generation_error(
-                    "wan/v2.6/reference-to-video", "At least one video URL is required"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "video_urls": video_urls,
-                "aspect_ratio": aspect_ratio,
-                "resolution": resolution,
-                "duration": duration,
-                "negative_prompt": negative_prompt,
-                "enable_prompt_expansion": enable_prompt_expansion,
-                "multi_shots": multi_shots,
-                "enable_safety_checker": enable_safety_checker,
-            }
-
-            # Add seed if specified (not -1)
-            if seed != -1:
-                arguments["seed"] = seed
-
-            result = ApiHandler.submit_and_get_result("wan/v2.6/reference-to-video", arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "wan/v2.6/reference-to-video", str(e)
-            )
-
-
-class FalSora2ProImageToVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "image": ("IMAGE",),
-            },
-            "optional": {
-                "resolution": (["auto", "720p", "1080p"], {"default": "auto"}),
-                "aspect_ratio": (["auto", "9:16", "16:9"], {"default": "auto"}),
-                "duration": ([4, 8, 12], {"default": 4}),
-                "delete_video": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, image, resolution="auto", aspect_ratio="auto", duration=4, delete_video=True):
-        try:
-            image_url = ImageUtils.upload_image(image)
-            if not image_url:
-                return ApiHandler.handle_video_generation_error(
-                    "sora-2/pro", "Failed to upload image"
-                )
-
-            arguments = {
-                "prompt": prompt,
-                "image_url": image_url,
-                "resolution": resolution,
-                "aspect_ratio": aspect_ratio,
-                "duration": duration,
-                "delete_video": delete_video,
-            }
-
-            result = ApiHandler.submit_and_get_result(
-                "fal-ai/sora-2/image-to-video/pro", arguments
-            )
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "sora-2/pro", str(e)
-            )
-
-
-class FalVeo31FirstLastFrameToVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "first_frame": ("IMAGE",),
-            },
-            "optional": {
-                "last_frame": ("IMAGE",),
-                "duration": (["4s", "6s", "8s"], {"default": "8s"}),
-                "aspect_ratio": (["auto", "9:16", "16:9", "1:1"], {"default": "auto"}),
-                "resolution": (["720p", "1080p"], {"default": "720p"}),
-                "generate_audio": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, first_frame, last_frame=None, duration="8s", aspect_ratio="auto", resolution="720p", generate_audio=True):
-        try:
-            first_frame_url = ImageUtils.upload_image(first_frame)
-            if not first_frame_url:
-                return ApiHandler.handle_video_generation_error(
-                    "veo3.1", "Failed to upload first frame"
-                )
-
-            # Conditional routing based on whether last_frame is provided
-            if last_frame is None:
-                # Use image-to-video endpoint (first frame only)
-                endpoint = "fal-ai/veo3.1/image-to-video"
-                arguments = {
-                    "prompt": prompt,
-                    "image_url": first_frame_url,
-                    "duration": duration,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "generate_audio": generate_audio,
-                }
-            else:
-                # Use first-last-frame-to-video endpoint (both frames)
-                endpoint = "fal-ai/veo3.1/first-last-frame-to-video"
-                last_frame_url = ImageUtils.upload_image(last_frame)
-                if not last_frame_url:
-                    return ApiHandler.handle_video_generation_error(
-                        "veo3.1", "Failed to upload last frame"
-                    )
-                arguments = {
-                    "prompt": prompt,
-                    "first_frame_url": first_frame_url,
-                    "last_frame_url": last_frame_url,
-                    "duration": duration,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "generate_audio": generate_audio,
-                }
-
-            result = ApiHandler.submit_and_get_result(endpoint, arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "veo3.1", str(e)
-            )
-
-
-class FalVeo31FastFirstLastFrameToVideo:
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "prompt": ("STRING", {"default": "", "multiline": True}),
-                "first_frame": ("IMAGE",),
-            },
-            "optional": {
-                "last_frame": ("IMAGE",),
-                "duration": (["4s", "6s", "8s"], {"default": "8s"}),
-                "aspect_ratio": (["auto", "9:16", "16:9", "1:1"], {"default": "auto"}),
-                "resolution": (["720p", "1080p"], {"default": "720p"}),
-                "generate_audio": ("BOOLEAN", {"default": True}),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    FUNCTION = "generate_video"
-    CATEGORY = "FAL/VideoGeneration"
-
-    def generate_video(self, prompt, first_frame, last_frame=None, duration="8s", aspect_ratio="auto", resolution="720p", generate_audio=True):
-        try:
-            first_frame_url = ImageUtils.upload_image(first_frame)
-            if not first_frame_url:
-                return ApiHandler.handle_video_generation_error(
-                    "veo3.1/fast", "Failed to upload first frame"
-                )
-
-            # Conditional routing based on whether last_frame is provided
-            if last_frame is None:
-                # Use image-to-video endpoint (first frame only)
-                endpoint = "fal-ai/veo3.1/fast/image-to-video"
-                arguments = {
-                    "prompt": prompt,
-                    "image_url": first_frame_url,
-                    "duration": duration,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "generate_audio": generate_audio,
-                }
-            else:
-                # Use first-last-frame-to-video endpoint (both frames)
-                endpoint = "fal-ai/veo3.1/fast/first-last-frame-to-video"
-                last_frame_url = ImageUtils.upload_image(last_frame)
-                if not last_frame_url:
-                    return ApiHandler.handle_video_generation_error(
-                        "veo3.1/fast", "Failed to upload last frame"
-                    )
-                arguments = {
-                    "prompt": prompt,
-                    "first_frame_url": first_frame_url,
-                    "last_frame_url": last_frame_url,
-                    "duration": duration,
-                    "aspect_ratio": aspect_ratio,
-                    "resolution": resolution,
-                    "generate_audio": generate_audio,
-                }
-
-            result = ApiHandler.submit_and_get_result(endpoint, arguments)
-            video_url = result["video"]["url"]
-            return (video_url,)
-        except Exception as e:
-            return ApiHandler.handle_video_generation_error(
-                "veo3.1/fast", str(e)
-            )
-
-
-# Update Node class mappings
 NODE_CLASS_MAPPINGS = {
-    "InfinityStarTextToVideo_fal": InfinityStarTextToVideoNode,
-    "Kling_fal": KlingNode,
-    "KlingPro10_fal": KlingPro10Node,
-    "KlingPro16_fal": KlingPro16Node,
-    "KlingMaster_fal": KlingMasterNode,
-    "KlingOmniImageToVideo_fal": KlingOmniImageToVideoNode,
-    "KlingOmniReferenceToVideo_fal": KlingOmniReferenceToVideoNode,
-    "KlingOmniVideoToVideoEdit_fal": KlingOmniVideoToVideoEditNode,
-    "KlingOmniVideoToVideoReference_fal": KlingOmniVideoToVideoReferenceNode,
-    "Krea_Wan14b_VideoToVideo_fal": KreaWan14bVideoToVideoNode,
-    "RunwayGen3_fal": RunwayGen3Node,
-    "LumaDreamMachine_fal": LumaDreamMachineNode,
+    "Seedance2TextToVideo_NBC": Seedance2TextToVideo_NBC,
+    "Seedance2ImageToVideo_NBC": Seedance2ImageToVideo_NBC,
+    "Seedance2ReferenceToVideo_NBC": Seedance2ReferenceToVideo_NBC,
+    "Seedance2ReferenceToVideoEnterprise_NBC": Seedance2ReferenceToVideoEnterprise_NBC,
+    "KlingV3Standard_NBC": KlingV3Standard_NBC,
+    "BlurFacesInVideo_NBC": BlurFacesInVideo_NBC,
+    "ExtractAudioFromVideo_NBC": ExtractAudioFromVideo_NBC,
+    "PreviewVideosFromURLs": PreviewVideosFromURLs,
     "LoadVideoURL": LoadVideoURL,
-    "UploadVideo_fal": UploadVideoNode,
-    "UploadFile_fal": UploadFileNode,
-    "MiniMax_fal": MiniMaxNode,
-    "MiniMaxTextToVideo_fal": MiniMaxTextToVideoNode,
-    "MiniMaxSubjectReference_fal": MiniMaxSubjectReferenceNode,
-    "PixverseSwapNode_fal": PixverseSwapNode,
-    "VideoUpscaler_fal": VideoUpscalerNode,
-    "CombinedVideoGeneration_fal": CombinedVideoGenerationNode,
-    "Veo2ImageToVideo_fal": Veo2ImageToVideoNode,
-    "WanPro_fal": WanProNode,
-    "Wan25_preview_fal": Wan25Node,
-    "WanVACEVideoEdit_fal": WanVACEVideoEditNode,
-    "Wan2214b_animate_replace_character_fal": Wan2214bAnimateReplaceNode,
-    "Wan2214b_animate_move_character_fal": Wan2214bAnimateMoveNode,
-    "Wan22VACEFun14b_fal": Wan22VACEFun14bNode,
-    "DYWanFun22_fal": DYWanFun22Node,
-    "DYWanUpscaler_fal": DYWanUpscalerNode,
-    "SeedanceImageToVideo_fal": SeedanceImageToVideoNode,
-    "SeedanceProImageToVideo_fal": SeedanceProImageToVideoNode,
-    "SeedanceTextToVideo_fal": SeedanceTextToVideoNode,
-    "Veo3_fal": Veo3Node,
-    "Kling21Pro_fal": FalKling21ProImageToVideo,
-    "Kling25TurboPro_fal": FalKling25TurboProImageToVideo,
-    "Kling26Pro_fal": FalKling26ProVideo,
-    "Wan26_fal": FalWan26Video,
-    "Wan26ReferenceToVideo_fal": FalWan26ReferenceToVideo,
-    "Sora2Pro_fal": FalSora2ProImageToVideo,
-    "Veo31_fal": FalVeo31FirstLastFrameToVideo,
-    "Veo31Fast_fal": FalVeo31FastFirstLastFrameToVideo,
+    "UploadVideo_fal": UploadVideo_fal,
 }
 
-# Update Node display name mappings
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "InfinityStarTextToVideo_fal": "Infinity Star Text-to-Video (fal)",
-    "Kling_fal": "Kling Video Generation (fal)",
-    "KlingPro10_fal": "Kling Pro v1.0 Video Generation (fal)",
-    "KlingPro16_fal": "Kling Pro v1.6 Video Generation (fal)",
-    "KlingMaster_fal": "Kling Master v2.0 Video Generation (fal)",
-    "KlingOmniImageToVideo_fal": "Kling Omni Image-to-Video (fal)",
-    "KlingOmniReferenceToVideo_fal": "Kling Omni Reference-to-Video (fal)",
-    "KlingOmniVideoToVideoEdit_fal": "Kling Omni Video-to-Video Edit (fal)",
-    "KlingOmniVideoToVideoReference_fal": "Kling Omni Video-to-Video Reference (fal)",
-    "Krea_Wan14b_VideoToVideo_fal": "Krea Wan 14b Video-to-Video (fal)",
-    "RunwayGen3_fal": "Runway Gen3 Image-to-Video (fal)",
-    "LumaDreamMachine_fal": "Luma Dream Machine (fal)",
+    "Seedance2TextToVideo_NBC": "Seedance 2.0 T2V Parallel (NBC)",
+    "Seedance2ImageToVideo_NBC": "Seedance 2.0 I2V Parallel (NBC)",
+    "Seedance2ReferenceToVideo_NBC": "Seedance 2.0 Reference Parallel (NBC)",
+    "Seedance2ReferenceToVideoEnterprise_NBC": "Seedance 2.0 Reference ENTERPRISE (NBC, cleared talent only)",
+    "KlingV3Standard_NBC": "Kling V3 Standard Parallel (NBC)",
+    "BlurFacesInVideo_NBC": "Blur Faces in Video (NBC)",
+    "ExtractAudioFromVideo_NBC": "Extract Audio from Video (NBC)",
+    "PreviewVideosFromURLs": "Preview Videos from URLs (fal)",
     "LoadVideoURL": "Load Video from URL",
-    "UploadVideo_fal": "Upload Video (fal)",
-    "UploadFile_fal": "Upload File (fal)",
-    "MiniMax_fal": "MiniMax Video Generation (fal)",
-    "MiniMaxTextToVideo_fal": "MiniMax Text-to-Video (fal)",
-    "MiniMaxSubjectReference_fal": "MiniMax Subject Reference (fal)",
-    "PixverseSwapNode_fal": "Pixverse Swap (fal)",
-    "VideoUpscaler_fal": "Video Upscaler (fal)",
-    "CombinedVideoGeneration_fal": "Combined Video Generation (fal)",
-    "Veo2ImageToVideo_fal": "Google Veo2 Image-to-Video (fal)",
-    "WanPro_fal": "Wan Pro Image-to-Video (fal)",
-    "SeedanceImageToVideo_fal": "Seedance Image-to-Video (fal)",
-    "SeedanceProImageToVideo_fal": "Seedance Pro Image-to-Video (fal)",
-    "SeedanceTextToVideo_fal": "Seedance Text-to-Video (fal)",
-    "Veo3_fal": "Veo3 Video Generation (fal)",
-    "Wan25_preview_fal": "Wan 2.5 Preview Image-to-Video (fal)",
-    "WanVACEVideoEdit_fal": "Wan VACE Video Edit (fal)",
-    "Wan2214b_animate_replace_character_fal": "Wan 2.2 14b Animate: Replace Character (fal)",
-    "Wan2214b_animate_move_character_fal": "Wan 2.2 14b Animate: Move Character (fal)",
-    "Wan22VACEFun14b_fal": "Wan 2.2 VACE Fun 14b Video-to-Video (fal)",
-    "DYWanFun22_fal": "DY Wan Fun 22 Video Generation (fal)",
-    "DYWanUpscaler_fal": "DY Wan Upscaler (fal)",
-    "Kling21Pro_fal": "Kling v2.1 Pro Image-to-Video (fal)",
-    "Kling25TurboPro_fal": "Kling v2.5 Turbo Pro Image-to-Video (fal)",
-    "Kling26Pro_fal": "Kling v2.6 Pro Video Generation (fal)",
-    "Wan26_fal": "Wan 2.6 Video Generation (fal)",
-    "Wan26ReferenceToVideo_fal": "Wan 2.6 Reference-to-Video (fal)",
-    "Sora2Pro_fal": "Sora 2 Pro Image-to-Video (fal)",
-    "Veo31_fal": "Veo 3.1 First-Last-Frame-to-Video (fal)",
-    "Veo31Fast_fal": "Veo 3.1 Fast First-Last-Frame-to-Video (fal)",
+    "UploadVideo_fal": "Upload Video to Fal",
 }
