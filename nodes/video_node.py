@@ -790,6 +790,27 @@ class BlurFacesInVideo_NBC:
         stream.pix_fmt = "yuv420p"
         stream.options = {"crf": "20", "preset": "veryfast"}
 
+        # Audio passthrough: open the source separately to copy audio packets without
+        # re-encoding (fast, lossless). Skip silently if the source has no audio.
+        audio_in_container = None
+        audio_in_stream = None
+        audio_out_stream = None
+        try:
+            audio_in_container = av.open(src_path)
+            audio_in_stream = next(
+                (s for s in audio_in_container.streams if s.type == "audio"), None
+            )
+            if audio_in_stream is not None:
+                # PyAV 14+ uses add_stream_from_template (older `template=` kwarg removed).
+                audio_out_stream = container.add_stream_from_template(audio_in_stream)
+        except Exception as e:
+            print(f"[fal-API] BlurFacesInVideo: audio passthrough skipped ({e})")
+            if audio_in_container is not None:
+                audio_in_container.close()
+                audio_in_container = None
+            audio_in_stream = None
+            audio_out_stream = None
+
         def _apply_obscuring(roi):
             """Three obscuring methods, picked via blur_method. The choice matters because
             Seedance reads its reference VISUALLY: a smooth gray blob can be interpreted
@@ -841,6 +862,7 @@ class BlurFacesInVideo_NBC:
         preview_frame_bgr = None
         frame_idx = 0
         total_faces_blurred = 0
+        audio_packets_copied = 0
         try:
             while True:
                 ret, frame = cap.read()
@@ -880,12 +902,31 @@ class BlurFacesInVideo_NBC:
 
             for packet in stream.encode():
                 container.mux(packet)
+
+            # Audio passthrough: demux source audio packets and remux into output.
+            # template= reuses the input codec/timebase, so packets pass through as-is.
+            if audio_in_container is not None and audio_in_stream is not None and audio_out_stream is not None:
+                try:
+                    for packet in audio_in_container.demux(audio_in_stream):
+                        if packet.dts is None:
+                            continue
+                        packet.stream = audio_out_stream
+                        container.mux(packet)
+                        audio_packets_copied += 1
+                except Exception as e:
+                    print(f"[fal-API] audio remux warning: {e}")
         finally:
             container.close()
             cap.release()
+            if audio_in_container is not None:
+                try:
+                    audio_in_container.close()
+                except Exception:
+                    pass
 
+        audio_msg = f", audio: {audio_packets_copied} packets copied" if audio_in_stream is not None else ", audio: none in source"
         print(f"[fal-API] BlurFacesInVideo: processed {frame_idx} frames, "
-              f"blurred {total_faces_blurred} face regions, output -> {out_path}")
+              f"blurred {total_faces_blurred} face regions{audio_msg}, output -> {out_path}")
 
         # Build the IMAGE preview tensor (B,H,W,C) float in [0,1].
         if preview_frame_bgr is None:
