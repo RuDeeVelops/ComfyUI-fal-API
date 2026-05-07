@@ -103,18 +103,43 @@ async def _fetch_result_with_fallbacks(handler, endpoint):
     )
 
 
+# Patterns that indicate a DETERMINISTIC content_policy_violation — same input will
+# always fail. Retrying these is pure waste (each retry = ~15 min on Seedance Reference
+# because fal runs moderation AFTER generation, not before).
+#
+# Probabilistic borderline violations (no specific likeness/IP keyword) DO sometimes
+# clear on retry per vicsee/segmind reports — we keep retry behavior for those.
+_DETERMINISTIC_POLICY_PATTERNS = (
+    "real person", "real people", "likeness", "likenesses",
+    "private information", "image_urls",
+    "trademark", "copyright", "intellectual property",
+    "partner_validation_failed",
+)
+
+
+def _is_deterministic_policy_violation(error_msg: str) -> bool:
+    msg = error_msg.lower()
+    return "content_policy_violation" in msg and any(
+        p in msg for p in _DETERMINISTIC_POLICY_PATTERNS
+    )
+
+
 async def _submit_with_retry(client, endpoint, args, max_retries=0, retry_label=""):
     """Submit + fetch with auto-retry on borderline content_policy_violation.
 
-    Per multiple independent reports, ByteDance/Seedance content moderation has a
-    probabilistic component — borderline inputs that fail one call may pass on the
-    next (frame-sampling variance, confidence-threshold jitter, ensemble-vote flips).
-    Retrying with backoff is the documented workaround.
+    Critical refinement: NOT all policy violations are worth retrying.
 
-    - Retries ONLY on content_policy_violation (other 4xx/5xx propagate immediately).
-    - Backoff: 3s, 6s, 12s (exponential).
-    - Caller controls seed per attempt: each retry passes args as-is, so set
-      seed=-1 upstream to randomize per attempt (we already do this in _run_parallel).
+    DETERMINISTIC violations — likeness of real people, IP/copyright/trademark —
+    will fail with the same input every time. fal runs moderation AFTER generation
+    (~15 min on Seedance Reference), so retrying these wastes ~15 min per attempt.
+    We detect known patterns and short-circuit.
+
+    PROBABILISTIC violations — borderline cases without specific keywords — do
+    sometimes clear on retry per vicsee/segmind reports. We keep the original
+    backoff retry for these.
+
+    - Retries ONLY on probabilistic content_policy_violation.
+    - Backoff: 3s, 6s, 12s.
     """
     last_error = None
     for attempt in range(max_retries + 1):
@@ -128,12 +153,23 @@ async def _submit_with_retry(client, endpoint, args, max_retries=0, retry_label=
             msg = str(e)
             if "content_policy_violation" not in msg.lower():
                 raise
+            # Deterministic violations: same input -> same failure. Don't waste
+            # another 15 min generation cycle on a known-bad input.
+            if _is_deterministic_policy_violation(msg):
+                print(
+                    f"[fal-API] {retry_label}: DETERMINISTIC content policy violation "
+                    f"(likeness / IP / copyright) — NOT retrying. Same input always fails. "
+                    f"Fix the input refs (Enterprise tier, fewer recognizable faces, "
+                    f"AI-generated stylized images, blurred face regions) before re-running."
+                )
+                raise
+            # Probabilistic borderline: retry with backoff.
             last_error = e
             if attempt >= max_retries:
                 raise
             backoff = 3 * (2 ** attempt)
             print(
-                f"[fal-API] {retry_label}: content_policy_violation "
+                f"[fal-API] {retry_label}: borderline content_policy_violation "
                 f"(attempt {attempt + 1}/{max_retries + 1}) — retrying in {backoff}s"
             )
             await asyncio.sleep(backoff)
