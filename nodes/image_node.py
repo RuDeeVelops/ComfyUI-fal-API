@@ -2349,6 +2349,103 @@ class GPTImage15:
             return ApiHandler.handle_image_generation_error("GPT-Image 1.5", e)
 
 
+class GPTImage2Edit:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "mask_image": ("IMAGE",),
+                "image_size": (
+                    ["auto", "square_hd", "square", "portrait_4_3",
+                     "portrait_16_9", "landscape_4_3", "landscape_16_9"],
+                    {"default": "auto"},
+                ),
+                "quality": (["low", "medium", "high"], {"default": "high"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "output_format": (["jpeg", "png", "webp"], {"default": "png"}),
+                "sync_mode": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "edit_image"
+    CATEGORY = "FAL/Image"
+
+    def edit_image(self, prompt, images, mask_image=None, image_size="auto",
+                   quality="high", num_images=1, output_format="png", sync_mode=False):
+        if images is not None and hasattr(images, 'shape') and len(images.shape) == 4 and images.shape[0] > 16:
+            images = images[:16]
+        image_urls = ImageUtils.prepare_images(images)
+        if len(image_urls) == 0:
+            print("Error: No valid images provided for GPT-Image 2")
+            return ResultProcessor.create_blank_image()
+
+        arguments = {
+            "prompt": prompt,
+            "image_urls": image_urls,
+            "image_size": image_size,
+            "quality": quality,
+            "num_images": num_images,
+            "output_format": output_format,
+            "sync_mode": sync_mode,
+        }
+        if mask_image is not None:
+            mask_url = ImageUtils.upload_image(mask_image)
+            if mask_url:
+                arguments["mask_image_url"] = mask_url
+
+        try:
+            result = ApiHandler.submit_and_get_result("fal-ai/gpt-image-2/image-to-image", arguments)
+            return ResultProcessor.process_image_result(result)
+        except Exception as e:
+            return ApiHandler.handle_image_generation_error("GPT-Image 2", e)
+
+
+class GPTImage2:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "prompt": ("STRING", {"default": "", "multiline": True}),
+            },
+            "optional": {
+                "image_size": (
+                    ["square_hd", "square", "portrait_4_3", "portrait_16_9",
+                     "landscape_4_3", "landscape_16_9"],
+                    {"default": "landscape_4_3"},
+                ),
+                "quality": (["low", "medium", "high"], {"default": "high"}),
+                "num_images": ("INT", {"default": 1, "min": 1, "max": 4}),
+                "output_format": (["jpeg", "png", "webp"], {"default": "png"}),
+                "sync_mode": ("BOOLEAN", {"default": False}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    FUNCTION = "generate_image"
+    CATEGORY = "FAL/Image"
+
+    def generate_image(self, prompt, image_size="landscape_4_3", quality="high",
+                       num_images=1, output_format="png", sync_mode=False):
+        arguments = {
+            "prompt": prompt,
+            "image_size": image_size,
+            "quality": quality,
+            "num_images": num_images,
+            "output_format": output_format,
+            "sync_mode": sync_mode,
+        }
+        try:
+            result = ApiHandler.submit_and_get_result("fal-ai/gpt-image-2", arguments)
+            return ResultProcessor.process_image_result(result)
+        except Exception as e:
+            return ApiHandler.handle_image_generation_error("GPT-Image 2", e)
+
+
 # Node class mappings
 NODE_CLASS_MAPPINGS = {
     "Ideogramv3_fal": Ideogramv3,
@@ -2379,6 +2476,8 @@ NODE_CLASS_MAPPINGS = {
     "Dreamina31TextToImage_fal": Dreamina31TextToImage,
     "GPTImage15Edit_fal": GPTImage15Edit,
     "GPTImage15_fal": GPTImage15,
+    "GPTImage2Edit_fal": GPTImage2Edit,
+    "GPTImage2_fal": GPTImage2,
 }
 
 
@@ -2412,4 +2511,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Dreamina31TextToImage_fal": "Dreamina v3.1 Text-to-Image (fal)",
     "GPTImage15Edit_fal": "GPT-Image 1.5 Edit (fal)",
     "GPTImage15_fal": "GPT-Image 1.5 (fal)",
+    "GPTImage2Edit_fal": "GPT-Image 2 Edit (fal)",
+    "GPTImage2_fal": "GPT-Image 2 (fal)",
 }
